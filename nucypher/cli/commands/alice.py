@@ -332,7 +332,7 @@ def run(general_config, character_options, config_file, controller_port, dry_run
 
 
 @alice.command("public-keys")
-@AliceInterface.connect('public_keys')
+@AliceInterface.connect_cli('public_keys')
 @group_character_options
 @option_config_file
 @group_general_config
@@ -347,7 +347,7 @@ def public_keys(general_config, character_options, config_file):
 
 
 @alice.command('derive-policy-pubkey')
-@AliceInterface.connect('derive_policy_encrypting_key')
+@AliceInterface.connect_cli('derive_policy_encrypting_key')
 @group_character_options
 @option_config_file
 @group_general_config
@@ -361,7 +361,7 @@ def derive_policy_pubkey(general_config, label, character_options, config_file):
 
 
 @alice.command()
-@AliceInterface.connect('grant')
+@AliceInterface.connect_cli('grant')
 @group_character_options
 @option_config_file
 @group_general_config
@@ -406,7 +406,7 @@ def grant(general_config,
 
 
 @alice.command()
-@AliceInterface.connect('revoke')
+@AliceInterface.connect_cli('revoke')
 @group_character_options
 @option_config_file
 @group_general_config
@@ -431,7 +431,7 @@ def revoke(general_config,
 
 
 @alice.command()
-@AliceInterface.connect('decrypt')
+@AliceInterface.connect_cli('decrypt')
 @group_character_options
 @option_config_file
 @group_general_config
