@@ -18,11 +18,13 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 import click
 from web3 import Web3
 
+from nucypher.blockchain.eth.actors import StakeHolder
+from nucypher.blockchain.eth.constants import MAX_UINT16
+from nucypher.blockchain.eth.events import EventRecord
 from nucypher.blockchain.eth.interfaces import BlockchainInterfaceFactory
 from nucypher.blockchain.eth.registry import IndividualAllocationRegistry
 from nucypher.blockchain.eth.token import NU, StakeList
 from nucypher.blockchain.eth.utils import datetime_at_period
-from nucypher.blockchain.eth.actors import StakeHolder
 from nucypher.cli import painting, actions
 from nucypher.cli.actions import (
     confirm_staged_stake,
@@ -31,12 +33,14 @@ from nucypher.cli.actions import (
     handle_client_account_for_staking,
     confirm_enable_restaking_lock,
     confirm_enable_restaking,
-    confirm_enable_winding_down
-)
+    confirm_enable_winding_down,
+    get_or_update_configuration)
+from nucypher.cli.config import group_general_config
 from nucypher.cli.options import (
     group_options,
     option_config_file,
     option_config_root,
+    option_event_name,
     option_force,
     option_hw_wallet,
     option_light,
@@ -45,15 +49,13 @@ from nucypher.cli.options import (
     option_provider_uri,
     option_registry_filepath,
     option_staking_address,
-    )
-from nucypher.cli.config import group_general_config
+)
 from nucypher.cli.painting import paint_receipt_summary
 from nucypher.cli.types import (
     EIP55_CHECKSUM_ADDRESS,
     EXISTING_READABLE_FILE
 )
 from nucypher.config.characters import StakeHolderConfiguration
-
 
 option_value = click.option('--value', help="Token value of stake", type=click.INT)
 option_lock_periods = click.option('--lock-periods', help="Duration of stake in periods.", type=click.INT)
@@ -63,7 +65,6 @@ option_worker_address = click.option('--worker-address', help="Address to assign
 def _setup_emitter(general_config):
     # Banner
     emitter = general_config.emitter
-    emitter.clear()
     emitter.banner(StakeHolder.banner)
 
     return emitter
@@ -119,6 +120,16 @@ class StakeHolderConfigOptions:
             registry_filepath=self.registry_filepath,
             domains={self.network}  # TODO: #1580
         )
+
+    def get_updates(self) -> dict:
+        payload = dict(provider_uri=self.provider_uri,
+                       poa=self.poa,
+                       light=self.light,
+                       registry_filepath=self.registry_filepath,
+                       domains={self.network} if self.network else None)  # TODO: #1580
+        # Depends on defaults being set on Configuration classes, filtrates None values
+        updates = {k: v for k, v in payload.items() if v is not None}
+        return updates
 
 
 group_config_options = group_options(
@@ -179,7 +190,7 @@ class TransactingStakerOptions:
         is_preallocation_staker = (self.beneficiary_address and opts.staking_address) or self.allocation_filepath
 
         if is_preallocation_staker:
-            network = opts.config_options.network or list(stakeholder_config.domains)[0]  #FIXME: ugly network/domains mapping
+            network = opts.config_options.network or list(stakeholder_config.domains)[0]  # TODO: 1580 - ugly network/domains mapping
             if self.allocation_filepath:
                 if self.beneficiary_address or opts.staking_address:
                     message = "--allocation-filepath is incompatible with --beneficiary-address and --staking-address."
@@ -253,6 +264,23 @@ def init_stakeholder(general_config, config_root, force, config_options):
     emitter.echo(f"Wrote new stakeholder configuration to {filepath}", color='green')
 
 
+@stake.command()
+@option_config_file
+@group_general_config
+@group_config_options
+def config(general_config, config_file, config_options):
+    """
+    View and optionally update existing StakeHolder's configuration.
+    """
+    emitter = _setup_emitter(general_config)
+    configuration_file_location = config_file or StakeHolderConfiguration.default_filepath()
+    emitter.echo(f"StakeHolder Configuration {configuration_file_location} \n {'='*55}")
+    return get_or_update_configuration(emitter=emitter,
+                                       config_class=StakeHolderConfiguration,
+                                       filepath=configuration_file_location,
+                                       config_options=config_options)
+
+
 @stake.command('list')
 @group_staker_options
 @option_config_file
@@ -264,7 +292,7 @@ def list_stakes(general_config, staker_options, config_file, all):
     """
     emitter = _setup_emitter(general_config)
     STAKEHOLDER = staker_options.create_character(emitter, config_file)
-    painting.paint_stakes(emitter=emitter, stakes=STAKEHOLDER.all_stakes, paint_inactive=all)
+    painting.paint_stakes(emitter=emitter, stakeholder=STAKEHOLDER, paint_inactive=all)
 
 
 @stake.command()
@@ -277,7 +305,7 @@ def accounts(general_config, staker_options, config_file):
     """
     emitter = _setup_emitter(general_config)
     STAKEHOLDER = staker_options.create_character(emitter, config_file)
-    painting.paint_accounts(emitter=emitter, balances=STAKEHOLDER.wallet.balances)
+    painting.paint_accounts(emitter=emitter, balances=STAKEHOLDER.wallet.balances, registry=STAKEHOLDER.registry)
 
 
 @stake.command('set-worker')
@@ -431,9 +459,10 @@ def create(general_config, transacting_staker_options, config_file, force, value
 
     if not lock_periods:
         min_locktime = STAKEHOLDER.economics.minimum_locked_periods
-        max_locktime = STAKEHOLDER.economics.maximum_rewarded_periods
+        default_locktime = STAKEHOLDER.economics.maximum_rewarded_periods
+        max_locktime = MAX_UINT16 - STAKEHOLDER.staking_agent.get_current_period()
         prompt = f"Enter stake duration ({min_locktime} - {max_locktime})"
-        lock_periods = click.prompt(prompt, type=stake_duration_range, default=max_locktime)
+        lock_periods = click.prompt(prompt, type=stake_duration_range, default=default_locktime)
 
     start_period = STAKEHOLDER.staking_agent.get_current_period() + 1
     unlock_period = start_period + lock_periods
@@ -593,21 +622,23 @@ def divide(general_config, transacting_staker_options, config_file, force, value
         stakeholder=STAKEHOLDER,
         staking_address=transacting_staker_options.staker_options.staking_address,
         individual_allocation=STAKEHOLDER.individual_allocation,
-        force=force)
+        force=force
+    )
 
     # Dynamic click types (Economics)
     min_locked = economics.minimum_allowed_locked
     stake_value_range = click.FloatRange(min=NU.from_nunits(min_locked).to_tokens(), clamp=False)
-    stake_extension_range = click.IntRange(min=1, max=economics.maximum_allowed_locked, clamp=False)
 
     if transacting_staker_options.staker_options.staking_address and index is not None:  # 0 is valid.
-        STAKEHOLDER.stakes = StakeList(
-            registry=STAKEHOLDER.registry,
-            checksum_address=transacting_staker_options.staker_options.staking_address)
+        STAKEHOLDER.stakes = StakeList(registry=STAKEHOLDER.registry,
+                                       checksum_address=transacting_staker_options.staker_options.staking_address)
         STAKEHOLDER.stakes.refresh()
         current_stake = STAKEHOLDER.stakes[index]
     else:
-        current_stake = select_stake(stakeholder=STAKEHOLDER, emitter=emitter, divisible=True)
+        current_stake = select_stake(stakeholder=STAKEHOLDER,
+                                     emitter=emitter,
+                                     divisible=True,
+                                     staker_address=client_account)
 
     #
     # Stage Stake
@@ -623,7 +654,10 @@ def divide(general_config, transacting_staker_options, config_file, force, value
 
     # Duration
     if not lock_periods:
-        extension = click.prompt("Enter number of periods to extend", type=stake_extension_range)
+        max_extension = MAX_UINT16 - current_stake.final_locked_period
+        divide_extension_range = click.IntRange(min=1, max=max_extension, clamp=False)
+        extension = click.prompt(f"Enter number of periods to extend (1 - {max_extension})",
+                                 type=divide_extension_range)
     else:
         extension = lock_periods
 
@@ -641,8 +675,7 @@ def divide(general_config, transacting_staker_options, config_file, force, value
     # Consistency check to prevent the above agreement from going stale.
     last_second_current_period = STAKEHOLDER.staking_agent.get_current_period()
     if action_period != last_second_current_period:
-        emitter.echo("Current period advanced before stake division was broadcasted. Please try again.",
-                     red='red')
+        emitter.echo("Current period advanced before stake division was broadcasted. Please try again.", red='red')
         raise click.Abort
 
     # Execute
@@ -657,7 +690,7 @@ def divide(general_config, transacting_staker_options, config_file, force, value
                           chain_name=blockchain.client.chain_name)
 
     # Show the resulting stake list
-    painting.paint_stakes(emitter=emitter, stakes=STAKEHOLDER.stakes)
+    painting.paint_stakes(emitter=emitter, stakeholder=STAKEHOLDER)
 
 
 @stake.command()
@@ -700,9 +733,14 @@ def prolong(general_config, transacting_staker_options, config_file, force, lock
 
     # Interactive
     if not lock_periods:
-        stake_extension_range = click.IntRange(min=1, max=economics.maximum_allowed_locked, clamp=False)
-        max_extension = economics.maximum_allowed_locked - current_stake.periods_remaining
-        lock_periods = click.prompt(f"Enter number of periods to extend (1-{max_extension})", type=stake_extension_range)
+        max_extension = MAX_UINT16 - current_stake.final_locked_period
+        # +1 because current period excluded
+        min_extension = economics.minimum_locked_periods - current_stake.periods_remaining + 1
+        if min_extension < 1:
+            min_extension = 1
+        duration_extension_range = click.IntRange(min=min_extension, max=max_extension, clamp=False)
+        lock_periods = click.prompt(f"Enter number of periods to extend ({min_extension}-{max_extension})",
+                                    type=duration_extension_range)
     if not force:
         click.confirm(f"Publish stake extension of {lock_periods} period(s) to the blockchain?", abort=True)
     password = transacting_staker_options.get_password(blockchain, client_account)
@@ -721,7 +759,7 @@ def prolong(general_config, transacting_staker_options, config_file, force, lock
     # Report
     emitter.echo('Successfully Prolonged Stake', color='green', verbosity=1)
     paint_receipt_summary(emitter=emitter, receipt=receipt, chain_name=blockchain.client.chain_name)
-    painting.paint_stakes(emitter=emitter, stakes=STAKEHOLDER.stakes)
+    painting.paint_stakes(emitter=emitter, stakeholder=STAKEHOLDER)
     return  # Exit
 
 
@@ -824,3 +862,44 @@ def preallocation(general_config, transacting_staker_options, config_file, actio
                               chain_name=STAKEHOLDER.wallet.blockchain.client.chain_name,
                               emitter=emitter)
 
+
+@stake.command()
+@group_staker_options
+@option_config_file
+@option_event_name
+@group_general_config
+def events(general_config, staker_options, config_file, event_name):
+    """
+    See blockchain events associated to a staker
+    """
+
+    ### Setup ###
+    emitter = _setup_emitter(general_config)
+
+    STAKEHOLDER = staker_options.create_character(emitter, config_file)
+    blockchain = staker_options.get_blockchain()
+
+    _client_account, staking_address = handle_client_account_for_staking(
+        emitter=emitter,
+        stakeholder=STAKEHOLDER,
+        staking_address=staker_options.staking_address,
+        individual_allocation=STAKEHOLDER.individual_allocation,
+        force=True)
+
+    title = f" {STAKEHOLDER.staking_agent.registry_contract_name} Events ".center(40, "-")
+    emitter.echo(f"\n{title}\n", bold=True, color='green')
+    if event_name:
+        events = [STAKEHOLDER.staking_agent.contract.events[event_name]]
+    else:
+        raise click.BadOptionUsage(message="You must specify an event name with --event-name")
+        # TODO: Doesn't work for the moment
+        # event_names = STAKEHOLDER.staking_agent.events.names
+        # events = [STAKEHOLDER.staking_agent.contract.events[e] for e in event_names]
+        # events = [e for e in events if 'staker' in e.argument_names]
+
+    for event in events:
+        emitter.echo(f"{event.event_name}:", bold=True, color='yellow')
+        event_filter = event.createFilter(fromBlock=0, toBlock='latest', argument_filters={'staker': staking_address})
+        entries = event_filter.get_all_entries()
+        for event_record in entries:
+            emitter.echo(f"  - {EventRecord(event_record)}")

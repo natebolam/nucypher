@@ -21,26 +21,30 @@ import os
 
 import click
 
+from nucypher.blockchain.eth.constants import NUCYPHER_CONTRACT_NAMES
 from nucypher.cli.types import (
     EIP55_CHECKSUM_ADDRESS,
     EXISTING_READABLE_FILE,
     NETWORK_PORT,
-    WEI)
+    WEI
+)
 
 
 # Alphabetical
 option_checksum_address = click.option('--checksum-address', help="Run with a specified account", type=EIP55_CHECKSUM_ADDRESS)
 option_config_file = click.option('--config-file', help="Path to configuration file", type=EXISTING_READABLE_FILE)
 option_config_root = click.option('--config-root', help="Custom configuration directory", type=click.Path())
+option_contract_name = click.option('--contract-name', help="Specify a single contract by name", type=click.Choice(NUCYPHER_CONTRACT_NAMES))
 option_dev = click.option('--dev', '-d', help="Enable development mode", is_flag=True)
 option_db_filepath = click.option('--db-filepath', help="The database filepath to connect to", type=click.STRING)
 option_dry_run = click.option('--dry-run', '-x', help="Execute normally without actually starting the node", is_flag=True)
 option_etherscan = click.option('--etherscan/--no-etherscan', help="Enable/disable viewing TX in Etherscan")
-option_federated_only = click.option('--federated-only', '-F', help="Connect only to federated nodes", is_flag=True, default=None)
+option_event_name = click.option('--event-name', help="Specify an event by name", type=click.STRING)
+option_federated_only = click.option('--federated-only/--decentralized', '-F', help="Connect only to federated nodes", is_flag=True, default=None)
 option_force = click.option('--force', help="Don't ask for confirmation", is_flag=True)
 option_geth = click.option('--geth', '-G', help="Run using the built-in geth node", is_flag=True)
 option_hw_wallet = click.option('--hw-wallet/--no-hw-wallet')
-option_light = click.option('--light', help="Indicate that node is light", is_flag=True)
+option_light = click.option('--light', help="Indicate that node is light", is_flag=True, default=None)
 option_m = click.option('--m', help="M-Threshold KFrags", type=click.INT)
 option_min_stake = click.option('--min-stake', help="The minimum stake the teacher must have to be a teacher", type=click.INT, default=0)
 option_n = click.option('--n', help="N-Total KFrags", type=click.INT)

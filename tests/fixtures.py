@@ -151,7 +151,7 @@ def ursula_federated_test_config():
                                         federated_only=True,
                                         network_middleware=MockRestMiddleware(),
                                         save_metadata=False,
-                                        reload_metadata=False, )
+                                        reload_metadata=False,)
     yield ursula_config
     ursula_config.cleanup()
 
@@ -182,7 +182,7 @@ def alice_federated_test_config(federated_ursulas):
                                 federated_only=True,
                                 abort_on_learning_error=True,
                                 save_metadata=False,
-                                reload_metadata=False)
+                                reload_metadata=False,)
     yield config
     config.cleanup()
 
@@ -212,7 +212,7 @@ def bob_federated_test_config():
                               abort_on_learning_error=True,
                               federated_only=True,
                               save_metadata=False,
-                              reload_metadata=False)
+                              reload_metadata=False,)
     yield config
     config.cleanup()
 
@@ -312,15 +312,19 @@ def capsule_side_channel(enacted_federated_policy):
             self.reset()
 
         def __call__(self):
-            enrico = Enrico(policy_encrypting_key=enacted_federated_policy.public_key)
             message = "Welcome to flippering number {}.".format(len(self.messages)).encode()
-            message_kit, _signature = enrico.encrypt_message(message)
-            self.messages.append((message_kit, enrico))
-            return message_kit, enrico
+            message_kit, _signature = self.enrico.encrypt_message(message)
+            self.messages.append((message_kit, self.enrico))
+            if self.plaintext_passthrough:
+                self.plaintexts.append(message)
+            return message_kit
 
-        def reset(self):
+        def reset(self, plaintext_passthrough=False):
+            self.enrico = Enrico(policy_encrypting_key=enacted_federated_policy.public_key)
             self.messages = []
-            self()
+            self.plaintexts = []
+            self.plaintext_passthrough = plaintext_passthrough
+            return self(), self.enrico
 
     return _CapsuleSideChannel()
 
@@ -332,15 +336,19 @@ def capsule_side_channel_blockchain(enacted_blockchain_policy):
             self.reset()
 
         def __call__(self):
-            enrico = Enrico(policy_encrypting_key=enacted_blockchain_policy.public_key)
             message = "Welcome to flippering number {}.".format(len(self.messages)).encode()
-            message_kit, _signature = enrico.encrypt_message(message)
-            self.messages.append((message_kit, enrico))
-            return message_kit, enrico
+            message_kit, _signature = self.enrico.encrypt_message(message)
+            self.messages.append((message_kit, self.enrico))
+            if self.plaintext_passthrough:
+                self.plaintexts.append(message)
+            return message_kit
 
-        def reset(self):
+        def reset(self, plaintext_passthrough=False):
+            self.enrico = Enrico(policy_encrypting_key=enacted_blockchain_policy.public_key)
             self.messages = []
-            self()
+            self.plaintexts = []
+            self.plaintext_passthrough = plaintext_passthrough
+            return self(), self.enrico
 
     return _CapsuleSideChannel()
 
@@ -446,7 +454,8 @@ def _make_testerchain():
 
     # Create the blockchain
     testerchain = TesterBlockchain(eth_airdrop=True, free_transactions=True)
-    BlockchainInterfaceFactory.register_interface(interface=testerchain)
+
+    BlockchainInterfaceFactory.register_interface(interface=testerchain, force=True)
 
     # Mock TransactingPower Consumption (Deployer)
     testerchain.transacting_power = TransactingPower(password=INSECURE_DEVELOPMENT_PASSWORD,
@@ -653,7 +662,8 @@ def blockchain_ursulas(testerchain, stakers, ursula_decentralized_test_config):
                                           stakers_addresses=testerchain.stakers_accounts,
                                           workers_addresses=testerchain.ursulas_accounts,
                                           confirm_activity=True)
-
+    for u in _ursulas:
+        u.synchronous_query_timeout = .01  # We expect to never have to wait for content that is actually on-chain during tests.
     testerchain.time_travel(periods=1)
 
     # Bootstrap the network
@@ -766,7 +776,7 @@ def _mock_ursula_reencrypts(ursula, corrupt_cfrag: bool = False):
     cfrag_signature = bytes(ursula.stamp(bytes(cfrag)))
 
     bob = Bob.from_public_keys(verifying_key=pub_key_bob)
-    task = WorkOrder.Task(capsule, task_signature, cfrag, cfrag_signature)
+    task = WorkOrder.PRETask(capsule, task_signature, cfrag, cfrag_signature)
     work_order = WorkOrder(bob, None, alice_address, [task], None, ursula, blockhash)
 
     evidence = IndisputableEvidence(task, work_order)

@@ -15,29 +15,24 @@ You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-
+import datetime
 import os
 
-import datetime
 import maya
 import pytest
-
 from umbral.kfrags import KFrag
 
-from nucypher.blockchain.eth.token import NU
 from nucypher.characters.lawful import Bob, Enrico
 from nucypher.config.characters import AliceConfiguration
 from nucypher.crypto.api import keccak_digest
 from nucypher.crypto.powers import SigningPower, DecryptingPower
-from nucypher.policy.collections import Revocation
+from nucypher.policy.collections import Revocation, PolicyCredential
 from nucypher.utilities.sandbox.constants import INSECURE_DEVELOPMENT_PASSWORD
 from nucypher.utilities.sandbox.middleware import MockRestMiddleware
-from nucypher.utilities.sandbox.policy import MockPolicyCreation
 
 
 @pytest.mark.usefixtures('blockchain_ursulas')
 def test_decentralized_grant(blockchain_alice, blockchain_bob, agency):
-
     # Setup the policy details
     n = 3
     policy_end_datetime = maya.now() + datetime.timedelta(days=5)
@@ -71,10 +66,33 @@ def test_decentralized_grant(blockchain_alice, blockchain_bob, agency):
 
         assert kfrag == retrieved_kfrag
 
+    # Test PolicyCredential w/o TreasureMap
+    credential = policy.credential(with_treasure_map=False)
+    assert credential.alice_verifying_key == policy.alice.stamp
+    assert credential.label == policy.label
+    assert credential.expiration == policy.expiration
+    assert credential.policy_pubkey == policy.public_key
+    assert credential.treasure_map is None
+
+    cred_json = credential.to_json()
+    deserialized_cred = PolicyCredential.from_json(cred_json)
+    assert credential == deserialized_cred
+
+    # Test PolicyCredential w/ TreasureMap
+    credential = policy.credential()
+    assert credential.alice_verifying_key == policy.alice.stamp
+    assert credential.label == policy.label
+    assert credential.expiration == policy.expiration
+    assert credential.policy_pubkey == policy.public_key
+    assert credential.treasure_map == policy.treasure_map
+
+    cred_json = credential.to_json()
+    deserialized_cred = PolicyCredential.from_json(cred_json)
+    assert credential == deserialized_cred
+
 
 @pytest.mark.usefixtures('federated_ursulas')
 def test_federated_grant(federated_alice, federated_bob):
-
     # Setup the policy details
     m, n = 2, 3
     policy_end_datetime = maya.now() + datetime.timedelta(days=5)
@@ -180,7 +198,6 @@ def test_revocation(federated_alice, federated_bob):
 
 
 def test_alices_powers_are_persistent(federated_ursulas, tmpdir):
-
     # Create a non-learning AliceConfiguration
     alice_config = AliceConfiguration(
         config_root=os.path.join(tmpdir, 'nucypher-custom-alice-config'),

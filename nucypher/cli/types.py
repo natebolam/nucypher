@@ -27,7 +27,12 @@ class ChecksumAddress(click.ParamType):
     name = 'checksum_address'
 
     def convert(self, value, param, ctx):
-        return to_checksum_address(value=value)  # TODO: More robust validation here?
+        try:
+            value = to_checksum_address(value=value)
+        except ValueError as e:
+            self.fail("Invalid ethereum address")
+        else:
+            return value
 
 
 class IPv4Address(click.ParamType):
@@ -37,7 +42,7 @@ class IPv4Address(click.ParamType):
         try:
             _address = ip_address(value)
         except ValueError as e:
-            self.fail(str(e))
+            self.fail("Invalid IP Address")
         else:
             return value
 

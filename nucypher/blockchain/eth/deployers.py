@@ -416,7 +416,7 @@ class NucypherTokenDeployer(BaseContractDeployer):
         self.check_deployment_readiness()
 
         # Order-sensitive!
-        constructor_kwargs = {"_totalSupply": self.economics.erc20_total_supply}
+        constructor_kwargs = {"_totalSupplyOfTokens": self.economics.erc20_total_supply}
         constructor_kwargs.update(overrides)
         constructor_kwargs = {k: v for k, v in constructor_kwargs.items() if v is not None}
         contract, deployment_receipt = self.blockchain.deploy_contract(self.deployer_address,
@@ -1133,7 +1133,7 @@ class WorklockDeployer(BaseContractDeployer):
         Convenience method for funding the contract and establishing the
         total worklock lot value to be auctioned.
         """
-        supply = self.economics.worklock_supply.to_nunits()
+        supply = int(self.economics.worklock_supply)
 
         token_agent = ContractAgency.get_agent(NucypherTokenAgent, registry=self.registry)
         approve_function = token_agent.contract.functions.approve(self.contract_address, supply)

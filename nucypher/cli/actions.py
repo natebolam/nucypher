@@ -32,8 +32,11 @@ from constant_sorrow.constants import (
     UNKNOWN_DEVELOPMENT_CHAIN_ID
 )
 from nacl.exceptions import CryptoError
+from tabulate import tabulate
 from twisted.logger import Logger
+from web3 import Web3
 
+from nucypher.blockchain.eth.actors import Staker
 from nucypher.blockchain.eth.agents import NucypherTokenAgent
 from nucypher.blockchain.eth.clients import NuCypherGethGoerliProcess
 from nucypher.blockchain.eth.decorators import validate_checksum_address
@@ -323,7 +326,6 @@ def make_cli_character(character_config,
     # Handle Keyring
 
     if unlock_keyring:
-        character_config.attach_keyring()
         unlock_nucypher_keyring(emitter,
                                 character_configuration=character_config,
                                 password=get_nucypher_password(confirm=False))
@@ -365,17 +367,25 @@ def make_cli_character(character_config,
     return CHARACTER
 
 
-def select_stake(stakeholder, emitter, divisible: bool = False) -> Stake:
-    stakes = stakeholder.all_stakes
+def select_stake(stakeholder, emitter, divisible: bool = False, staker_address: str = None) -> Stake:
+    if staker_address:
+        staker = stakeholder.get_staker(checksum_address=staker_address)
+        stakes = staker.stakes
+    else:
+        stakes = stakeholder.all_stakes
+    if not stakes:
+        emitter.echo(f"No stakes found.", color='red')
+        raise click.Abort
+
     stakes = sorted((stake for stake in stakes if stake.is_active), key=lambda s: s.address_index_ordering_key)
     if divisible:
         emitter.echo("NOTE: Showing divisible stakes only", color='yellow')
-        stakes = list(filter(lambda s: bool(s.value >= stakeholder.economics.minimum_allowed_locked*2), stakes))
+        stakes = list(filter(lambda s: bool(s.value >= stakeholder.economics.minimum_allowed_locked*2), stakes))  # TODO: Move to method on Stake
         if not stakes:
             emitter.echo(f"No divisible stakes found.", color='red')
             raise click.Abort
     enumerated_stakes = dict(enumerate(stakes))
-    painting.paint_stakes(stakes=stakes, emitter=emitter)
+    painting.paint_stakes(stakeholder=stakeholder, emitter=emitter, staker_address=staker_address)
     choice = click.prompt("Select Stake", type=click.IntRange(min=0, max=len(enumerated_stakes)-1))
     chosen_stake = enumerated_stakes[choice]
     return chosen_stake
@@ -387,11 +397,13 @@ def select_client_account(emitter,
                           default: int = 0,
                           registry=None,
                           show_balances: bool = True,
+                          show_staking: bool = False,
                           network: str = None
                           ) -> str:
     """
     Note: Setting show_balances to True, causes an eager contract and blockchain connection.
     """
+    # TODO: Break show_balances into show_eth_balance and show_token_balance
 
     if not provider_uri:
         raise ValueError("Provider URI must be provided to select a wallet account.")
@@ -403,9 +415,9 @@ def select_client_account(emitter,
 
     # Lazy connect to contracts
     token_agent = None
-    if show_balances:
+    if show_balances or show_staking:
         if not registry:
-            registry = InMemoryContractRegistry.from_latest_publication(network)
+            registry = InMemoryContractRegistry.from_latest_publication(network=network)
         token_agent = NucypherTokenAgent(registry=registry)
 
     # Real wallet accounts
@@ -415,22 +427,34 @@ def select_client_account(emitter,
         raise click.Abort()
 
     # Display account info
-    header = f'| # | Account  ---------------------------------- | Balance -----' \
-             f'\n================================================================='
-    emitter.echo(header)
+    headers = ['Account']
+    if show_staking:
+        headers.append('Staking')
+    if show_balances:
+        headers.extend(('', ''))
+
+    rows = list()
     for index, account in enumerated_accounts.items():
-        message = f"| {index} | {account} "
+        row = [account]
+        if show_staking:
+            staker = Staker(is_me=True, checksum_address=account, registry=registry)
+            staker.stakes.refresh()
+            is_staking = 'Yes' if bool(staker.stakes) else 'No'
+            row.append(is_staking)
         if show_balances:
-            message += f" | {NU.from_nunits(token_agent.get_balance(address=account))}"
-        emitter.echo(message)
+            token_balance = NU.from_nunits(token_agent.get_balance(address=account))
+            ether_balance = Web3.fromWei(blockchain.client.get_balance(account=account), 'ether')
+            row.extend((token_balance, f'{ether_balance} ETH'))
+        rows.append(row)
+    emitter.echo(tabulate(rows, headers=headers, showindex='always'))
 
     # Prompt the user for selection, and return
-    prompt = prompt or "Select Account"
+    prompt = prompt or "Select index of account"
     account_range = click.IntRange(min=0, max=len(enumerated_accounts)-1)
     choice = click.prompt(prompt, type=account_range, default=default)
     chosen_account = enumerated_accounts[choice]
 
-    emitter.echo(f"Selected {choice}:{chosen_account}", color='blue')
+    emitter.echo(f"Selected {choice}: {chosen_account}", color='blue')
     return chosen_account
 
 
@@ -461,11 +485,13 @@ def handle_client_account_for_staking(emitter,
         if staking_address:
             client_account = staking_address
         else:
-            client_account = select_client_account(prompt="Select staking account",
+            client_account = select_client_account(prompt="Select index of staking account",
                                                    emitter=emitter,
                                                    registry=stakeholder.registry,
                                                    network=stakeholder.network,
-                                                   provider_uri=stakeholder.wallet.blockchain.provider_uri)
+                                                   provider_uri=stakeholder.wallet.blockchain.provider_uri,
+                                                   show_balances=True,
+                                                   show_staking=True)
             staking_address = client_account
 
     return client_account, staking_address
@@ -503,14 +529,20 @@ def confirm_enable_restaking(emitter, staking_address: str) -> bool:
 
 
 def confirm_enable_winding_down(emitter, staking_address: str) -> bool:
-    winding_down_agreement = f"Over time, as the locked stake duration decreases i.e. `winds down`, " \
-                             f"you will receive decreasing inflationary rewards. " \
-                             f"Instead, by disabling `wind down` (default) the locked stake duration " \
-                             f"can remain constant until you specify that `wind down` should begin. " \
-                             f"By keeping the locked stake duration constant, it ensures that you will " \
-                             f"receive maximum inflation compensation. If `wind down` was previously disabled, " \
-                             f"you can enable it at any point and the locked duration will decrease after each period.\n" \
-                             f"For more information see https://docs.nucypher.com/en/latest/architecture/sub_stakes.html#winding-down."
+    winding_down_agreement = f"""
+Over time, as the locked stake duration decreases
+i.e. `winds down`, you will receive decreasing inflationary rewards.
+
+Instead, by disabling `wind down` (default) the locked stake duration
+can remain constant until you specify that `wind down` should begin. By
+keeping the locked stake duration constant, it ensures that you will
+receive maximum inflation compensation.
+
+If `wind down` was previously disabled, you can enable it at any point
+and the locked duration will decrease after each period.
+
+For more information see https://docs.nucypher.com/en/latest/architecture/sub_stakes.html#winding-down.
+"""
     emitter.message(winding_down_agreement)
     click.confirm(f"Confirm enable automatic winding down for staker {staking_address}?", abort=True)
     return True
@@ -552,3 +584,25 @@ def establish_deployer_registry(emitter,
     emitter.message(f"Configured to registry filepath {registry_filepath}")
 
     return registry
+
+
+def get_or_update_configuration(emitter, config_class, filepath: str, config_options):
+
+    try:
+        config = config_class.from_configuration_file(filepath=filepath)
+    except config_class.ConfigurationError:
+        # Issue warning for invalid configuration...
+        emitter.message(f"Invalid Configuration at {filepath}.")
+        try:
+            # ... but try to display it anyways
+            response = config_class._read_configuration_file(filepath=filepath)
+            return emitter.echo(json.dumps(response, indent=4))
+        except JSONDecodeError:
+            # ... sorry
+            return emitter.message(f"Invalid JSON in Configuration File at {filepath}.")
+    else:
+        updates = config_options.get_updates()
+        if updates:
+            emitter.message(f"Updated configuration values: {', '.join(updates)}", color='yellow')
+            config.update(**updates)
+        return emitter.echo(config.serialize())

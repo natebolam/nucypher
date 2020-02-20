@@ -17,7 +17,7 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 
 from _pydecimal import Decimal
 from collections import UserList
-from typing import Union, Tuple
+from typing import Union, Tuple, Dict
 
 import maya
 from constant_sorrow.constants import (
@@ -212,7 +212,7 @@ class Stake:
                                                   start_of_period=True)
 
         if validate_now:
-            self.validate_duration()
+            self.validate()
 
         self.receipt = NO_STAKING_RECEIPT
 
@@ -257,6 +257,7 @@ class Stake:
                        final_locked_period=final_locked_period,
                        value=NU(value, 'NuNit'),
                        economics=economics,
+                       validate_now=False,
                        *args, **kwargs)
 
         instance.worker_address = instance.staking_agent.get_worker_from_staker(staker_address=checksum_address)
@@ -295,6 +296,17 @@ class Stake:
             delta = self.unlock_datetime.epoch - blocktime_epoch
             result = delta
         return result
+
+    def describe(self) -> Dict[str, str]:
+        start_datetime = self.start_datetime.local_datetime().strftime("%b %d %Y")
+        end_datetime = self.unlock_datetime.local_datetime().strftime("%b %d %Y")
+
+        data = dict(index=self.index,
+                    value=str(self.value),
+                    remaining=self.periods_remaining,
+                    enactment=start_datetime,
+                    last_period=end_datetime)
+        return data
 
     #
     # Validation
@@ -391,7 +403,8 @@ class Stake:
                                final_locked_period=self.final_locked_period,
                                value=remaining_stake_value,
                                staking_agent=self.staking_agent,
-                               economics=self.economics)
+                               economics=self.economics,
+                               validate_now=False)
 
         # New Derived Stake
         end_period = self.final_locked_period + additional_periods
@@ -401,7 +414,8 @@ class Stake:
                           value=target_value,
                           index=NEW_STAKE,
                           staking_agent=self.staking_agent,
-                          economics=self.economics)
+                          economics=self.economics,
+                          validate_now=False)
 
         #
         # Validate

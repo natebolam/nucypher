@@ -1150,6 +1150,12 @@ class Staker(NucypherTokenActor):
             raise TypeError("This method can only be used when staking via a contract")
         return receipt
 
+    @property
+    def missing_confirmations(self) -> int:
+        staker_address = self.checksum_address
+        missing = self.staking_agent.get_missing_confirmations(checksum_address=staker_address)
+        return missing
+
 
 class Worker(NucypherTokenActor):
     """
@@ -1178,6 +1184,9 @@ class Worker(NucypherTokenActor):
 
         # Agency
         self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)
+
+        # Someday, when we have Workers for tasks other than PRE, this might instead be composed on Ursula.
+        self.policy_agent = ContractAgency.get_agent(PolicyManagerAgent, registry=self.registry)
 
         # Stakes
         self.__start_time = WORKER_NOT_RUNNING
@@ -1223,20 +1232,11 @@ class Worker(NucypherTokenActor):
         receipt = self.staking_agent.confirm_activity(worker_address=self.__worker_address)
         return receipt
 
-    def get_missing_confirmations(self) -> int:
+    @property
+    def missing_confirmations(self) -> int:
         staker_address = self.checksum_address
-        last_confirmed_period = self.staking_agent.get_last_active_period(staker_address)
-        current_period = self.staking_agent.get_current_period()
-        missing_confirmations = current_period - last_confirmed_period
-        if missing_confirmations in (0, -1):
-            result = 0
-        elif missing_confirmations == current_period:  # never confirmed
-            stakes = self.staking_agent.get_all_stakes(staker_address=staker_address)
-            initial_staking_period = min(stakes, key=lambda s: s[0])
-            result = current_period - initial_staking_period
-        else:
-            result = missing_confirmations
-        return result
+        missing = self.staking_agent.get_missing_confirmations(checksum_address=staker_address)
+        return missing
 
 
 class BlockchainPolicyAuthor(NucypherTokenActor):
@@ -1485,6 +1485,21 @@ class StakeHolder(Staker):
             stakes.extend(more_stakes)
         return stakes
 
+    @validate_checksum_address
+    def get_staker(self, checksum_address: str):
+        if checksum_address not in self.wallet.accounts:
+            raise ValueError(f"{checksum_address} is not a known client account.")
+        staker = Staker(is_me=True, checksum_address=checksum_address, registry=self.registry)
+        staker.stakes.refresh()
+        return staker
+
+    def get_stakers(self) -> List[Staker]:
+        stakers = list()
+        for account in self.wallet.accounts:
+            staker = self.get_staker(checksum_address=account)
+            stakers.append(staker)
+        return stakers
+
     @property
     def total_stake(self) -> NU:
         """
@@ -1507,11 +1522,20 @@ class Bidder(NucypherTokenActor):
     class BidingIsClosed(BidderError):
         pass
 
-    def __init__(self, checksum_address: str, *args, **kwargs):
+    @validate_checksum_address
+    def __init__(self,
+                 checksum_address: str,
+                 is_transacting: bool = True,
+                 client_password: str = None,
+                 *args, **kwargs):
         super().__init__(checksum_address=checksum_address, *args, **kwargs)
         self.worklock_agent = ContractAgency.get_agent(WorkLockAgent, registry=self.registry)
         self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)
         self.economics = EconomicsFactory.get_economics(registry=self.registry)
+
+        if is_transacting:
+            self.transacting_power = TransactingPower(password=client_password, account=checksum_address)
+            self.transacting_power.activate()
 
     def _ensure_bidding_is_open(self) -> None:
         highest_block = self.worklock_agent.blockchain.w3.eth.getBlock('latest')

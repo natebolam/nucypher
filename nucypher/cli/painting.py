@@ -22,6 +22,7 @@ from typing import List
 
 import click
 import maya
+import tabulate
 import time
 from constant_sorrow.constants import NO_KNOWN_NODES
 from web3 import Web3
@@ -38,12 +39,12 @@ from nucypher.blockchain.eth.constants import NUCYPHER_TOKEN_CONTRACT_NAME, STAK
 from nucypher.blockchain.eth.deployers import DispatcherDeployer, StakingInterfaceRouterDeployer
 from nucypher.blockchain.eth.interfaces import BlockchainInterface, BlockchainInterfaceFactory
 from nucypher.blockchain.eth.registry import BaseContractRegistry
+from nucypher.blockchain.eth.sol import SOLIDITY_COMPILER_VERSION
 from nucypher.blockchain.eth.token import NU
-from nucypher.blockchain.eth.utils import datetime_at_period, etherscan_url
+from nucypher.blockchain.eth.utils import datetime_at_period, etherscan_url, prettify_eth_amount
 from nucypher.characters.banners import NUCYPHER_BANNER, NU_BANNER
 from nucypher.config.constants import SEEDNODES
 from nucypher.network.nicknames import nickname_from_seed
-from nucypher.blockchain.eth.sol import SOLIDITY_COMPILER_VERSION
 
 
 def echo_version(ctx, param, value):
@@ -254,7 +255,7 @@ Registry  ................ {registry.filepath}
 
     try:
         token_agent = ContractAgency.get_agent(NucypherTokenAgent, registry=registry)
-        token_contract_info = """
+        token_contract_info = f"""
 
 {token_agent.contract_name} ........... {token_agent.contract_address}
     ~ Ethers ............ {Web3.fromWei(blockchain.client.get_balance(token_agent.contract_address), 'ether')} ETH
@@ -416,10 +417,10 @@ def paint_staged_stake(emitter,
     unlock_datetime_pretty = unlock_datetime.local_datetime().strftime("%b %d %H:%M %Z")
 
     if division_message:
-        emitter.echo(f"\n{'=' * 30} ORIGINAL STAKE {'=' * 28}", bold=True)
+        emitter.echo(f"\n{'═' * 30} ORIGINAL STAKE {'═' * 28}", bold=True)
         emitter.echo(division_message)
 
-    emitter.echo(f"\n{'=' * 30} STAGED STAKE {'=' * 30}", bold=True)
+    emitter.echo(f"\n{'═' * 30} STAGED STAKE {'═' * 30}", bold=True)
 
     emitter.echo(f"""
 Staking address: {staking_address}
@@ -432,7 +433,7 @@ Staking address: {staking_address}
 
     # TODO: periods != Days - Do we inform the user here?
 
-    emitter.echo('=========================================================================', bold=True)
+    emitter.echo('═'*73, bold=True)
 
 
 def paint_staking_confirmation(emitter, staker, new_stake):
@@ -445,6 +446,57 @@ or set your Ursula worker node address by running 'nucypher stake set-worker'.
 
 See https://docs.nucypher.com/en/latest/guides/staking_guide.html'''
     emitter.echo(next_steps, color='green')
+
+
+def paint_stakes(emitter, stakeholder, paint_inactive: bool = False, staker_address: str = None):
+    headers = ('Idx', 'Value', 'Remaining', 'Enactment', 'Termination')
+    staker_headers = ('Status', 'Restaking', 'Winding Down', 'Unclaimed Fees')
+
+    stakers = stakeholder.get_stakers()
+    if not stakers:
+        emitter.echo("No staking accounts found.")
+
+    total_stakers = 0
+    for staker in stakers:
+        if not staker.stakes:
+            # This staker has no active stakes.
+            # TODO: Something with non-staking accounts?
+            continue
+
+        # Filter Target
+        if staker_address and staker.checksum_address != staker_address:
+            continue
+
+        stakes = sorted(staker.stakes, key=lambda s: s.address_index_ordering_key)
+        active_stakes = filter(lambda s: s.is_active, stakes)
+        if not active_stakes:
+            emitter.echo(f"There are no active stakes\n")
+
+        fees = staker.policy_agent.get_reward_amount(staker.checksum_address)
+        gwei_fees = f"{Web3.fromWei(fees, 'gwei')} Gwei"
+        last_confirmed = staker.staking_agent.get_last_active_period(staker.checksum_address)
+        missing = staker.missing_confirmations
+
+        staker_data = [f'Missing {missing} confirmation{"s" if missing > 1 else ""}' if missing else f'Confirmed #{last_confirmed}',
+                       f'{"Yes" if staker.is_restaking else "No"} ({"Locked" if staker.restaking_lock_enabled else "Unlocked"})',
+                       "Yes" if bool(staker.is_winding_down) else "No",
+                       gwei_fees]
+
+        emitter.echo(f"\nStaker {staker.checksum_address} ════", bold=True, color='red' if missing else 'green')
+        emitter.echo(f"Worker {staker.worker_address} ════")
+        emitter.echo(tabulate.tabulate(zip(staker_headers, staker_data), floatfmt="fancy_grid"))
+
+        rows = list()
+        for index, stake in enumerate(stakes):
+            if not stake.is_active and not paint_inactive:
+                # This stake is inactive.
+                continue
+            rows.append(list(stake.describe().values()))
+        total_stakers += 1
+        emitter.echo(tabulate.tabulate(rows, headers=headers, tablefmt="fancy_grid"))  # newline
+
+    if not total_stakers:
+        emitter.echo("No Stakes found", color='red')
 
 
 def prettify_stake(stake, index: int = None) -> str:
@@ -465,47 +517,13 @@ def prettify_stake(stake, index: int = None) -> str:
     return pretty
 
 
-def paint_stakes(emitter, stakes, paint_inactive: bool = False):
-    header = f'| ~ | Staker | Worker | # | Value    | Duration     | Enactment          '
-    breaky = f'|   | ------ | ------ | - | -------- | ------------ | ----------------------------------------- '
-
-    active_stakes = sorted((stake for stake in stakes if stake.is_active),
-                           key=lambda some_stake: some_stake.address_index_ordering_key)
-    if active_stakes:
-        title = "======================================= Active Stakes =========================================\n"
-        emitter.echo(title)
-        emitter.echo(header, bold=True)
-        emitter.echo(breaky, bold=True)
-
-        for index, stake in enumerate(active_stakes):
-            row = prettify_stake(stake=stake, index=index)
-            row_color = 'yellow' if stake.worker_address == BlockchainInterface.NULL_ADDRESS else 'white'
-            emitter.echo(row, color=row_color)
-        emitter.echo('')  # newline
-
-    if paint_inactive:
-        title = "\n====================================== Inactive Stakes ========================================\n"
-        emitter.echo(title)
-        emitter.echo(header, bold=True)
-        emitter.echo(breaky, bold=True)
-
-        for stake in sorted([s for s in stakes if s not in active_stakes],  # TODO: Code optimization here..?
-                            key=lambda some_stake: some_stake.address_index_ordering_key):
-            row = prettify_stake(stake=stake, index=None)
-            emitter.echo(row, color='red')
-
-        emitter.echo('')  # newline
-    elif not active_stakes:
-        emitter.echo(f"There are no active stakes\n")
-
-
 def paint_staged_stake_division(emitter,
                                 stakeholder,
                                 original_stake,
                                 target_value,
                                 extension):
     new_end_period = original_stake.final_locked_period + extension
-    new_duration_periods = new_end_period - original_stake.first_locked_period
+    new_duration_periods = new_end_period - original_stake.first_locked_period + 1
     staking_address = original_stake.staker_address
 
     division_message = f"""
@@ -519,11 +537,13 @@ Staking address: {staking_address}
                        stake_value=target_value,
                        lock_periods=new_duration_periods,
                        start_period=original_stake.first_locked_period,
-                       unlock_period=new_end_period,
+                       unlock_period=new_end_period + 1,
                        division_message=division_message)
 
 
-def paint_accounts(emitter, balances):
+def paint_accounts(emitter, balances, registry):
+    from nucypher.blockchain.eth.actors import Staker
+
     rows = list()
     max_eth_len, max_nu_len = 0, 0
     for address, balances in sorted(balances.items()):
@@ -533,13 +553,12 @@ def paint_accounts(emitter, balances):
         max_eth_len = max(max_eth_len, len(eth))
         max_nu_len = max(max_nu_len, len(nu))
 
-        rows.append((address, eth, nu))
-
-    header = f'| Account  ------------------------------- | Balances ------------------' \
-             f'\n========================================================================'
-    emitter.echo(header)
-    for address, eth, nu in rows:
-        emitter.echo(f"{address} | {eth:{max_eth_len}} | {nu:{max_nu_len}}")
+        staker = Staker(is_me=True, checksum_address=address, registry=registry)
+        staker.stakes.refresh()
+        is_staking = 'Yes' if bool(staker.stakes) else 'No'
+        rows.append((is_staking, address, eth, nu))
+    headers = ('Staking', 'Account', 'ETH', 'NU')
+    emitter.echo(tabulate.tabulate(rows, headers=headers, tablefmt="fancy_grid"))
 
 
 def paint_receipt_summary(emitter, receipt, chain_name: str = None, transaction_type=None, provider_uri: str = None):
@@ -832,7 +851,7 @@ Slowing Refund .... {worklock_agent.contract.functions.SLOWING_REFUND().call()}
 Refund Rate ....... {worklock_agent.get_refund_rate()}
 Deposit Rate ...... {worklock_agent.get_deposit_rate()}
     """
-    emitter.message(payload)
+    emitter.echo(payload)
     return
 
 
@@ -846,7 +865,7 @@ Completed Work ....... {bidder.completed_work}
 Remaining Work ....... {bidder.remaining_work}
 Refunded Work ........ {bidder.refunded_work}
 """
-    emitter.message(message)
+    emitter.echo(message)
     return
 
 
@@ -856,47 +875,53 @@ def paint_bidding_notice(emitter, bidder):
 * WorkLock Participant Notice *
 -------------------------------
 
-- By participating in NuCypher's WorkLock you are committing to operating a staking NuCypher
-  node after the bidding window closes.
+- By participating in NuCypher's WorkLock you are committing to operating a staking
+  NuCypher node after the bidding window closes.
 
-- WorkLock token rewards are claimed in the form of a stake and will be locked for the stake duration.
+- WorkLock token rewards are claimed in the form of a stake and will be locked for
+  the stake duration.
 
-- WorkLock ETH deposits will be available for refund at a rate of {bidder.worklock_agent.economics.worklock_refund_rate} 
-  wei per confirmed period - This rate will become frozen on {maya.MayaDT(bidder.worklock_agent.end_date).local_datetime()}.
+- WorkLock ETH deposits will be available for refund at a rate of {prettify_eth_amount(bidder.worklock_agent.get_refund_rate())} 
+  per confirmed period. This rate will become frozen on {maya.MayaDT(bidder.economics.bidding_end_date).local_datetime()}.
 
-- Once claiming WorkLock tokens, you are obligated to maintain a networked
-  and available Ursula-Worker node bonded to the staker address {bidder.checksum_address} for the duration 
-  of the stake(s) ({bidder.worklock_agent.economics.worklock_commitment_duration} periods).
+- Once claiming WorkLock tokens, you are obligated to maintain a networked and available
+  Ursula-Worker node bonded to the staker address {bidder.checksum_address}
+  for the duration of the stake(s) ({bidder.economics.worklock_commitment_duration} periods).
 
-- Allow NuCypher network users to carry out uninterrupted re-encryption
-  work orders at-will without interference. Failure to keep your node online, 
-  or violation of re-encryption work orders will result in the loss of staked tokens as
-  described in the NuCypher slashing protocol.
+- Allow NuCypher network users to carry out uninterrupted re-encryption work orders
+  at-will without interference. Failure to keep your node online, or violation of
+  re-encryption work orders will result in the loss of staked tokens as described
+  in the NuCypher slashing protocol.
 
-- Keeping your Ursula node online during the staking period and successfully
-  producing correct re-encryption work orders will result in rewards
-  paid out in ethers retro-actively and on-demand.
+- Keeping your Ursula node online during the staking period and correctly servicing
+  re-encryption work orders will result in rewards paid out in ethers retro-actively
+  and on-demand.
 
-Accept worklock terms and node operator obligation?"""
+Accept WorkLock terms and node operator obligation?"""  # TODO: Show a special message for first bidder, since there's no refund rate yet?
 
-    emitter.message(obligation)
+    emitter.echo(obligation)
     return
 
 
-def paint_worklock_claim(emitter, bidder_address: str):
+def paint_worklock_claim(emitter, bidder_address: str, network: str, provider_uri: str):
     message = f"""
 
 Successfully claimed WorkLock tokens for {bidder_address}.
 
-Next Steps for Worklock Winners
+You can check that the stake was created correctly by running:
+
+  nucypher status stakers --staking-address {bidder_address} --network {network} --provider {provider_uri}
+
+Next Steps for WorkLock Winners
 ===============================
 
-See the official nucypher documentation for a comprehensive guide!
+Congratulations! You're officially a Staker in the NuCypher network.
 
-Create a stake with your allocation contract: 
-'nucypher stake create --provider <URI> --staking-address {bidder_address}'
+See the official NuCypher documentation for a comprehensive guide on next steps!
 
-Bond a worker to your stake: 'nucypher stake set-worker --worker-address <WORKER ADDRESS>'
+As a first step, you need to bond a worker to your stake by running:
+
+  nucypher stake set-worker --worker-address <WORKER ADDRESS>
 
 """
-    emitter.message(message, color='green')
+    emitter.echo(message, color='green')

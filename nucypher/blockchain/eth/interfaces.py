@@ -59,6 +59,8 @@ from nucypher.blockchain.eth.providers import (
 )
 from nucypher.blockchain.eth.registry import BaseContractRegistry
 from nucypher.blockchain.eth.sol.compile import SolidityCompiler
+from nucypher.blockchain.eth.utils import prettify_eth_amount
+
 
 Web3Providers = Union[IPCProvider, WebsocketProvider, HTTPProvider, EthereumTester]
 
@@ -372,6 +374,7 @@ class BlockchainInterface:
 
         payload_pprint = dict(payload)
         payload_pprint['from'] = to_checksum_address(payload['from'])
+        payload_pprint.update({f: prettify_eth_amount(v) for f, v in payload.items() if f in ('gasPrice', 'value')})
         payload_pprint = ', '.join("{}: {}".format(k, v) for k, v in payload_pprint.items())
         self.log.debug(f"[TX-{transaction_name}] | {payload_pprint}")
 
@@ -824,10 +827,11 @@ class BlockchainInterfaceFactory:
                            interface: BlockchainInterface,
                            sync: bool = False,
                            emitter=None,
+                           force: bool = False,
                            ) -> None:
 
         provider_uri = interface.provider_uri
-        if provider_uri in cls._interfaces:
+        if (provider_uri in cls._interfaces) and not force:
             raise cls.InterfaceAlreadyInitialized(f"A connection already exists for {provider_uri}. "
                                                   "Use .get_interface instead.")
         cached = cls.CachedInterface(interface=interface, sync=sync, emitter=emitter)
