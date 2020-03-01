@@ -39,6 +39,7 @@ from nucypher.utilities.sandbox.constants import (
     select_test_port,
 )
 from nucypher.utilities.sandbox.middleware import MockRestMiddleware
+from tests.fixtures import MIN_REWARD_RATE_RANGE
 
 
 @mock.patch('nucypher.config.characters.StakeHolderConfiguration.default_filepath', return_value='/non/existent/file')
@@ -139,6 +140,8 @@ def test_stake_list(click_runner,
     result = click_runner.invoke(nucypher_cli, stake_args, input=user_input, catch_exceptions=False)
     assert result.exit_code == 0
     assert str(stake_value) in result.output
+    _minimum, default, _maximum = MIN_REWARD_RATE_RANGE
+    assert f"{default} wei" in result.output
 
 
 def test_staker_divide_stakes(click_runner,
@@ -238,7 +241,6 @@ def test_ursula_init(click_runner,
     init_args = ('ursula', 'init',
                  '--poa',
                  '--network', TEMPORARY_DOMAIN,
-                 '--staker-address', manual_staker,
                  '--worker-address', manual_worker,
                  '--config-root', custom_filepath,
                  '--provider', TEST_PROVIDER_URI,
@@ -266,7 +268,6 @@ def test_ursula_init(click_runner,
         config_data = json.loads(raw_config_data)
         assert config_data['provider_uri'] == TEST_PROVIDER_URI
         assert config_data['worker_address'] == manual_worker
-        assert config_data['checksum_address'] == manual_staker
         assert TEMPORARY_DOMAIN in config_data['domains']
 
 
@@ -605,3 +606,37 @@ def test_stake_detach_worker(click_runner,
                     registry=agency_local_registry)
 
     assert not staker.worker_address
+
+
+def test_set_min_rate(click_runner,
+                      manual_staker,
+                      testerchain,
+                      agency_local_registry,
+                      stakeholder_configuration_file_location):
+
+    _minimum, _default, maximum = MIN_REWARD_RATE_RANGE
+    min_rate = maximum - 1
+    staker = Staker(is_me=True, checksum_address=manual_staker, registry=agency_local_registry)
+    assert staker.raw_min_reward_rate == 0
+
+    restake_args = ('stake', 'set-min-rate',
+                    '--min-rate', min_rate,
+                    '--config-file', stakeholder_configuration_file_location,
+                    '--staking-address', manual_staker,
+                    '--force')
+
+    result = click_runner.invoke(nucypher_cli,
+                                 restake_args,
+                                 input=INSECURE_DEVELOPMENT_PASSWORD,
+                                 catch_exceptions=False)
+    assert result.exit_code == 0
+    assert staker.raw_min_reward_rate == min_rate
+    assert "successfully set" in result.output
+
+    stake_args = ('stake', 'list',
+                  '--config-file', stakeholder_configuration_file_location)
+
+    user_input = INSECURE_DEVELOPMENT_PASSWORD
+    result = click_runner.invoke(nucypher_cli, stake_args, input=user_input, catch_exceptions=False)
+    assert result.exit_code == 0
+    assert f"{min_rate} wei" in result.output

@@ -34,7 +34,7 @@ from nucypher.cli.actions import (
     confirm_enable_restaking_lock,
     confirm_enable_restaking,
     confirm_enable_winding_down,
-    get_or_update_configuration)
+    get_or_update_configuration, issue_stake_suggestions)
 from nucypher.cli.config import group_general_config
 from nucypher.cli.options import (
     group_options,
@@ -53,8 +53,8 @@ from nucypher.cli.options import (
 from nucypher.cli.painting import paint_receipt_summary
 from nucypher.cli.types import (
     EIP55_CHECKSUM_ADDRESS,
-    EXISTING_READABLE_FILE
-)
+    EXISTING_READABLE_FILE,
+    WEI)
 from nucypher.config.characters import StakeHolderConfiguration
 
 option_value = click.option('--value', help="Token value of stake", type=click.INT)
@@ -335,6 +335,10 @@ def set_worker(general_config, transacting_staker_options, config_file, force, w
     if not worker_address:
         worker_address = click.prompt("Enter worker address", type=EIP55_CHECKSUM_ADDRESS)
 
+    if (worker_address == staking_address) and not force:
+        click.confirm("The worker address provided is the same as the staking account.  "
+                      "It is highly recommended to use a different accounts for staker and worker roles.", abort=True)
+
     # TODO: Check preconditions (e.g., minWorkerPeriods, already in use, etc)
 
     password = transacting_staker_options.get_password(blockchain, client_account)
@@ -468,10 +472,11 @@ def create(general_config, transacting_staker_options, config_file, force, value
     unlock_period = start_period + lock_periods
 
     #
-    # ReviewPub
+    # Review and Publish
     #
 
     if not force:
+        issue_stake_suggestions(value=value, lock_periods=lock_periods)
         painting.paint_staged_stake(emitter=emitter,
                                     stakeholder=STAKEHOLDER,
                                     staking_address=staking_address,
@@ -498,7 +503,6 @@ def create(general_config, transacting_staker_options, config_file, force, value
     # Authenticate and Execute
     STAKEHOLDER.assimilate(checksum_address=client_account, password=password)
 
-    emitter.echo("Broadcasting stake...", color='yellow')
     new_stake = STAKEHOLDER.initialize_stake(amount=value, lock_periods=lock_periods)
 
     painting.paint_staking_confirmation(emitter=emitter, staker=STAKEHOLDER, new_stake=new_stake)
@@ -656,12 +660,13 @@ def divide(general_config, transacting_staker_options, config_file, force, value
     if not lock_periods:
         max_extension = MAX_UINT16 - current_stake.final_locked_period
         divide_extension_range = click.IntRange(min=1, max=max_extension, clamp=False)
-        extension = click.prompt(f"Enter number of periods to extend (1 - {max_extension})",
+        extension = click.prompt(f"Enter number of periods to extend",
                                  type=divide_extension_range)
     else:
         extension = lock_periods
 
     if not force:
+        issue_stake_suggestions(lock_periods=extension, value=value)
         painting.paint_staged_stake_division(emitter=emitter,
                                              stakeholder=STAKEHOLDER,
                                              original_stake=current_stake,
@@ -680,7 +685,6 @@ def divide(general_config, transacting_staker_options, config_file, force, value
 
     # Execute
     STAKEHOLDER.assimilate(checksum_address=current_stake.staker_address, password=password)
-    emitter.echo("Broadcasting Stake Division...", color='yellow')
     modified_stake, new_stake = STAKEHOLDER.divide_stake(stake_index=current_stake.index,
                                                          target_value=value,
                                                          additional_periods=extension)
@@ -753,7 +757,6 @@ def prolong(general_config, transacting_staker_options, config_file, force, lock
 
     # Authenticate and Execute
     STAKEHOLDER.assimilate(checksum_address=current_stake.staker_address, password=password)
-    emitter.echo("Broadcasting Stake Extension...", color='yellow')
     receipt = STAKEHOLDER.prolong_stake(stake_index=current_stake.index, additional_periods=lock_periods)
 
     # Report
@@ -903,3 +906,47 @@ def events(general_config, staker_options, config_file, event_name):
         entries = event_filter.get_all_entries()
         for event_record in entries:
             emitter.echo(f"  - {EventRecord(event_record)}")
+
+
+@stake.command('set-min-rate')
+@group_transacting_staker_options
+@option_config_file
+@option_force
+@group_general_config
+@click.option('--min-rate', help="Minimum acceptable reward rate", type=WEI)
+def set_min_rate(general_config, transacting_staker_options, config_file, force, min_rate):
+    """
+    Set minimum acceptable value for the reward rate.
+    """
+    emitter = _setup_emitter(general_config)
+
+    STAKEHOLDER = transacting_staker_options.create_character(emitter, config_file)
+    blockchain = transacting_staker_options.get_blockchain()
+
+    client_account, staking_address = handle_client_account_for_staking(
+        emitter=emitter,
+        stakeholder=STAKEHOLDER,
+        staking_address=transacting_staker_options.staker_options.staking_address,
+        individual_allocation=STAKEHOLDER.individual_allocation,
+        force=force)
+
+    if not min_rate:
+        painting.paint_min_rate(emitter, STAKEHOLDER.registry, STAKEHOLDER.policy_agent, staking_address)
+        # TODO check range
+        min_rate = click.prompt("Enter new value for min reward rate within range", type=WEI)
+
+    password = transacting_staker_options.get_password(blockchain, client_account)
+
+    if not force:
+        click.confirm(f"Commit new value {min_rate} for "
+                      f"minimum acceptable reward rate?", abort=True)
+
+    STAKEHOLDER.assimilate(checksum_address=client_account, password=password)
+    receipt = STAKEHOLDER.set_min_reward_rate(min_rate=min_rate)
+
+    # Report Success
+    emitter.echo(f"\nMinimum reward rate {min_rate} successfully set by staker {staking_address}", color='green')
+    paint_receipt_summary(emitter=emitter,
+                          receipt=receipt,
+                          chain_name=blockchain.client.chain_name,
+                          transaction_type='set_min_rate')

@@ -19,6 +19,7 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 import csv
 import json
 import os
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Tuple, List, Dict, Union
@@ -28,6 +29,9 @@ import maya
 from constant_sorrow.constants import (
     WORKER_NOT_RUNNING,
     NO_WORKER_ASSIGNED,
+    BARE,
+    IDLE,
+    FULL
 )
 from eth_tester.exceptions import TransactionFailed
 from eth_utils import keccak, is_checksum_address, to_checksum_address
@@ -265,7 +269,7 @@ class ContractAdministrator(NucypherTokenActor):
                         contract_name: str,
                         gas_limit: int = None,
                         plaintext_secret: str = None,
-                        bare: bool = False,
+                        deployment_mode=FULL,
                         ignore_deployed: bool = False,
                         progress=None,
                         confirmations: int = 0,
@@ -286,7 +290,7 @@ class ContractAdministrator(NucypherTokenActor):
 
         self.transacting_power.activate()  # Activate the TransactingPower in case too much time has passed
         if Deployer._upgradeable:
-            is_initial_deployment = not bare
+            is_initial_deployment = deployment_mode != BARE  # i.e., we also deploy a dispatcher
             if is_initial_deployment and not plaintext_secret:
                 raise ValueError("An upgrade secret must be passed to perform initial deployment of a Dispatcher.")
             secret_hash = None
@@ -294,14 +298,16 @@ class ContractAdministrator(NucypherTokenActor):
                 secret_hash = keccak(bytes(plaintext_secret, encoding='utf-8'))
             receipts = deployer.deploy(secret_hash=secret_hash,
                                        gas_limit=gas_limit,
-                                       initial_deployment=is_initial_deployment,
                                        progress=progress,
                                        ignore_deployed=ignore_deployed,
-                                       confirmations=confirmations)
+                                       confirmations=confirmations,
+                                       deployment_mode=deployment_mode,
+                                       **deployment_parameters)
         else:
             receipts = deployer.deploy(gas_limit=gas_limit,
                                        progress=progress,
                                        confirmations=confirmations,
+                                       deployment_mode=deployment_mode,
                                        **deployment_parameters)
         return receipts, deployer
 
@@ -660,6 +666,21 @@ class ContractAdministrator(NucypherTokenActor):
             data = json.dumps(data, indent=4)
             file.write(data)
         return filepath
+
+    def set_min_reward_rate_range(self,
+                                  minimum: int,
+                                  default: int,
+                                  maximum: int,
+                                  transaction_gas_limit: int = None) -> dict:
+
+        policy_manager_deployer = PolicyManagerDeployer(registry=self.registry,
+                                                        deployer_address=self.deployer_address,
+                                                        economics=self.economics)
+        receipt = policy_manager_deployer.set_min_reward_rate_range(minimum=minimum,
+                                                                    default=default,
+                                                                    maximum=maximum,
+                                                                    gas_limit=transaction_gas_limit)
+        return receipt
 
 
 class MultiSigActor(NucypherTokenActor):
@@ -1156,11 +1177,44 @@ class Staker(NucypherTokenActor):
         missing = self.staking_agent.get_missing_confirmations(checksum_address=staker_address)
         return missing
 
+    @only_me
+    @save_receipt
+    def set_min_reward_rate(self, min_rate: int) -> Tuple[str, str]:
+        """Public facing method for setting min reward rate."""
+        minimum, _default, maximum = self.policy_agent.get_min_reward_rate_range()
+        if min_rate < minimum or min_rate > maximum:
+            raise ValueError(f"Min reward rate  {min_rate} must be within range [{minimum}, {maximum}]")
+        if self.is_contract:
+            receipt = self.preallocation_escrow_agent.set_min_reward_rate(min_rate=min_rate)
+        else:
+            receipt = self.policy_agent.set_min_reward_rate(staker_address=self.checksum_address, min_rate=min_rate)
+        return receipt
+
+    @property
+    def min_reward_rate(self) -> int:
+        """Minimum acceptable reward rate"""
+        staker_address = self.checksum_address
+        min_rate = self.policy_agent.get_min_reward_rate(staker_address)
+        return min_rate
+
+    @property
+    def raw_min_reward_rate(self) -> int:
+        """Minimum acceptable reward rate set by staker.
+        This's not applicable if this rate out of global range.
+        In that case default value will be used instead of raw value (see `min_reward_rate`)"""
+
+        staker_address = self.checksum_address
+        min_rate = self.policy_agent.get_raw_min_reward_rate(staker_address)
+        return min_rate
+
 
 class Worker(NucypherTokenActor):
     """
     Ursula baseclass for blockchain operations, practically carrying a pickaxe.
     """
+
+    BONDING_TIMEOUT = None  # (None or 0) == indefinite
+    BONDING_POLL_RATE = 10
 
     class WorkerError(NucypherTokenActor.ActorError):
         pass
@@ -1173,14 +1227,16 @@ class Worker(NucypherTokenActor):
                  work_tracker: WorkTracker = None,
                  worker_address: str = None,
                  start_working_now: bool = True,
-                 check_active_worker: bool = True,
+                 block_until_ready: bool = True,
                  *args, **kwargs):
 
         super().__init__(*args, **kwargs)
         self.log = Logger("worker")
 
-        self.__worker_address = worker_address
         self.is_me = is_me
+
+        self._checksum_address = None  # Stake Address
+        self.__worker_address = worker_address
 
         # Agency
         self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)
@@ -1194,14 +1250,67 @@ class Worker(NucypherTokenActor):
 
         # Workers cannot be started without being assigned a stake first.
         if is_me:
+            if block_until_ready:
+                self.block_until_ready()
             self.stakes = StakeList(registry=self.registry, checksum_address=self.checksum_address)
             self.stakes.refresh()
-            if check_active_worker and not len(self.stakes):
-                raise self.DetachedWorker(f"{self.__worker_address} is not bonded to {self.checksum_address}.")
 
             self.work_tracker = work_tracker or WorkTracker(worker=self)
             if start_working_now:
                 self.work_tracker.start(act_now=False)
+
+    def block_until_ready(self, poll_rate: int = None, timeout: int = None):
+        """
+        Polls the staking_agent and blocks until the staking address is not
+        a null address for the given worker_address. Once the worker is bonded, it returns the staker address.
+        """
+        if not self.__worker_address:
+            raise RuntimeError("No worker address available")
+
+        timeout = timeout or self.BONDING_TIMEOUT
+        poll_rate = poll_rate or self.BONDING_POLL_RATE
+        staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)
+        client = staking_agent.blockchain.client
+        start = maya.now()
+
+        emitter = StdoutEmitter()  # TODO: Make injectable, or embed this logic into Ursula
+        emitter.message("Waiting for bonding and funding...")
+
+        funded, bonded = False, False
+        while True:
+
+            # Read
+            staking_address = staking_agent.get_staker_from_worker(self.__worker_address)
+            ether_balance = client.get_balance(self.__worker_address)
+
+            # Bonding
+            if (not bonded) and (staking_address != BlockchainInterface.NULL_ADDRESS):
+                bonded = True
+                emitter.message(f"Worker is bonded to ({staking_address})!", color='green', bold=True)
+
+            # Balance
+            if ether_balance and (not funded):
+                funded, balance = True, Web3.fromWei(ether_balance, 'ether')
+                emitter.message(f"Worker is funded with {balance} ETH!", color='green', bold=True)
+
+            # Success and Escape
+            if staking_address != BlockchainInterface.NULL_ADDRESS and ether_balance:
+                self._checksum_address = staking_address
+                emitter.message(f"Starting services...", color='yellow', bold=True)
+                break
+
+            # Crash on Timeout
+            if timeout:
+                now = maya.now()
+                delta = now - start
+                if delta.total_seconds() >= timeout:
+                    if staking_address == BlockchainInterface.NULL_ADDRESS:
+                        raise self.DetachedWorker(f"Worker {self.__worker_address} not bonded after waiting {timeout} seconds.")
+                    elif not ether_balance:
+                        raise RuntimeError(f"Worker {self.__worker_address} has no ether after waiting {timeout} seconds.")
+
+            # Increment
+            time.sleep(poll_rate)
 
     @property
     def eth_balance(self) -> Decimal:
@@ -1263,6 +1372,11 @@ class BlockchainPolicyAuthor(NucypherTokenActor):
         self.rate = rate
         self.duration_periods = duration_periods
 
+    @property
+    def default_rate(self):
+        _minimum, default, _maximum = self.policy_agent.get_min_reward_rate_range()
+        return default
+
     def generate_policy_parameters(self,
                                    number_of_ursulas: int = None,
                                    duration_periods: int = None,
@@ -1278,7 +1392,7 @@ class BlockchainPolicyAuthor(NucypherTokenActor):
             raise ValueError("Policy end time must be specified as 'expiration' or 'duration_periods', got neither.")
 
         # Merge injected and default params.
-        rate = rate or self.rate
+        rate = rate or self.rate  # TODO conflict with CLI default value, see #1709
         duration_periods = duration_periods or self.duration_periods
 
         # Calculate duration in periods and expiration datetime

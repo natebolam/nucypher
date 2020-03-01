@@ -18,8 +18,6 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 import pathlib
 from contextlib import contextmanager
 
-from sentry_sdk import capture_exception, add_breadcrumb
-from sentry_sdk.integrations.logging import LoggingIntegration
 from twisted.logger import FileLogObserver, jsonFileLogObserver, formatEvent, formatEventAsClassicLogText
 from twisted.logger import LogLevel
 from twisted.logger import globalLogPublisher
@@ -37,7 +35,12 @@ MAX_LOG_FILES = 10
 
 
 def initialize_sentry(dsn: str):
-    import sentry_sdk
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.logging import LoggingIntegration
+    except ImportError:
+        raise ImportError('Sentry SDK is not installed. Please install it and try again.')
+
     import logging
 
     # Logger blacklist
@@ -70,7 +73,9 @@ def initialize_sentry(dsn: str):
 
 
 class GlobalLoggerSettings:
+
     log_level = LogLevel.levelWithName("info")
+    _json_ipc = False  # TODO: Oh no... #1754
 
     @classmethod
     def set_log_level(cls, log_level_name):
@@ -138,6 +143,11 @@ class _SentryInitGuard:
 
 
 def sentry_observer(event):
+    try:
+        from sentry_sdk import capture_exception, add_breadcrumb
+    except ImportError:
+        raise ImportError('Sentry SDK is not installed. Please install it and try again.')
+
     # Handle breadcrumbs...
     if not event.get('isError') or 'failure' not in event:
         add_breadcrumb(level=event.get('log_level').name,

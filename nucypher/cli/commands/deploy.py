@@ -19,17 +19,23 @@ import json
 import os
 
 import click
+from constant_sorrow import constants
+from constant_sorrow.constants import (
+    BARE,
+    FULL
+)
 
 from nucypher.blockchain.eth.actors import ContractAdministrator, Trustee
 from nucypher.blockchain.eth.agents import NucypherTokenAgent, ContractAgency, MultiSigAgent
+from nucypher.blockchain.eth.constants import STAKING_ESCROW_CONTRACT_NAME
 from nucypher.blockchain.eth.interfaces import BlockchainDeployerInterface, BlockchainInterfaceFactory
+from nucypher.blockchain.eth.networks import NetworksInventory
 from nucypher.blockchain.eth.registry import (
     BaseContractRegistry,
     InMemoryContractRegistry,
     RegistrySourceManager,
     GithubRegistrySource
 )
-from nucypher.blockchain.eth.networks import NetworksInventory
 from nucypher.blockchain.eth.token import NU
 from nucypher.cli.actions import (
     get_client_password,
@@ -37,6 +43,7 @@ from nucypher.cli.actions import (
     confirm_deployment,
     establish_deployer_registry
 )
+from nucypher.cli.config import group_general_config
 from nucypher.cli.options import (
     group_options,
     option_config_root,
@@ -47,7 +54,6 @@ from nucypher.cli.options import (
     option_provider_uri,
     option_contract_name
 )
-from nucypher.cli.config import group_general_config
 from nucypher.cli.painting import (
     echo_solidity_version,
     paint_staged_deployment,
@@ -58,18 +64,19 @@ from nucypher.cli.painting import (
     paint_multisig_contract_info,
     paint_multisig_proposed_transaction
 )
-from nucypher.cli.types import EIP55_CHECKSUM_ADDRESS, EXISTING_READABLE_FILE
+from nucypher.cli.types import EIP55_CHECKSUM_ADDRESS, EXISTING_READABLE_FILE, GAS_STRATEGY_CHOICES
+from nucypher.cli.types import WEI
 from nucypher.config.constants import DEFAULT_CONFIG_ROOT
-
 
 option_deployer_address = click.option('--deployer-address', help="Deployer's checksum address", type=EIP55_CHECKSUM_ADDRESS)
 option_registry_infile = click.option('--registry-infile', help="Input path for contract registry file", type=EXISTING_READABLE_FILE)
 option_registry_outfile = click.option('--registry-outfile', help="Output path for contract registry file", type=click.Path(file_okay=True))
 option_target_address = click.option('--target-address', help="Address of the target contract", type=EIP55_CHECKSUM_ADDRESS)
 option_gas = click.option('--gas', help="Operate with a specified gas per-transaction limit", type=click.IntRange(min=1))
+option_gas_strategy = click.option('--gas-strategy', help="Operate with a specified gas price strategy", type=click.STRING)  # TODO: GAS_STRATEGY_CHOICES
 option_network = click.option('--network', help="Name of NuCypher network", type=click.Choice(NetworksInventory.networks))
 option_ignore_deployed = click.option('--ignore-deployed', help="Ignore already deployed contracts if exist.", is_flag=True)
-option_ignore_solidity_version = click.option('--ignore-solidity-check', help="Ignore solidity version compatibility check", is_flag=True, default=None)
+option_ignore_solidity_version = click.option('--ignore-solidity-check', help="Ignore solidity version compatibility check", is_flag=True)
 
 
 def _pre_launch_warnings(emitter, etherscan, hw_wallet):
@@ -85,15 +92,18 @@ def _pre_launch_warnings(emitter, etherscan, hw_wallet):
                      color='yellow')
 
 
-def _initialize_blockchain(poa, provider_uri, emitter, ignore_solidity_check):
+def _initialize_blockchain(poa, provider_uri, emitter, ignore_solidity_check, gas_strategy=None):
     if not BlockchainInterfaceFactory.is_interface_initialized(provider_uri=provider_uri):
         # Note: For test compatibility.
         deployer_interface = BlockchainDeployerInterface(provider_uri=provider_uri,
                                                          poa=poa,
-                                                         ignore_solidity_check=ignore_solidity_check)
+                                                         ignore_solidity_check=ignore_solidity_check,
+                                                         gas_strategy=gas_strategy)
+
         BlockchainInterfaceFactory.register_interface(interface=deployer_interface,
                                                       sync=False,
-                                                      emitter=emitter)
+                                                      emitter=emitter,
+                                                      gas_strategy=gas_strategy)
     else:
         deployer_interface = BlockchainInterfaceFactory.get_interface(provider_uri=provider_uri)
 
@@ -114,8 +124,9 @@ class ActorOptions:
 
     def __init__(self, provider_uri, deployer_address, contract_name,
                  registry_infile, registry_outfile, hw_wallet, dev, force, poa, config_root, etherscan,
-                 se_test_mode, ignore_solidity_check):
+                 se_test_mode, ignore_solidity_check, gas_strategy):
         self.provider_uri = provider_uri
+        self.gas_strategy = gas_strategy
         self.deployer_address = deployer_address
         self.contract_name = contract_name
         self.registry_infile = registry_infile
@@ -132,7 +143,11 @@ class ActorOptions:
     def create_actor(self, emitter):
 
         _ensure_config_root(self.config_root)
-        deployer_interface = _initialize_blockchain(self.poa, self.provider_uri, emitter, self.ignore_solidity_check)
+        deployer_interface = _initialize_blockchain(poa=self.poa,
+                                                    provider_uri=self.provider_uri,
+                                                    emitter=emitter,
+                                                    ignore_solidity_check=self.ignore_solidity_check,
+                                                    gas_strategy=self.gas_strategy)
 
         # Warnings
         _pre_launch_warnings(emitter, self.etherscan, self.hw_wallet)
@@ -179,6 +194,7 @@ class ActorOptions:
 group_actor_options = group_options(
     ActorOptions,
     provider_uri=option_provider_uri(),
+    gas_strategy=option_gas_strategy,
     contract_name=option_contract_name,
     poa=option_poa,
     force=option_force,
@@ -257,7 +273,10 @@ def inspect(general_config, provider_uri, config_root, registry_infile, deployer
     # Init
     emitter = general_config.emitter
     _ensure_config_root(config_root)
-    _initialize_blockchain(poa, provider_uri, emitter, ignore_solidity_check)
+    _initialize_blockchain(poa=poa,
+                           provider_uri=provider_uri,
+                           emitter=emitter,
+                           ignore_solidity_check=ignore_solidity_check)
 
     local_registry = establish_deployer_registry(emitter=emitter,
                                                  registry_infile=registry_infile,
@@ -359,13 +378,19 @@ def rollback(general_config, actor_options):
 @deploy.command()
 @group_general_config
 @group_actor_options
-@click.option('--bare', help="Deploy a contract *only* without any additional operations.", is_flag=True)
 @option_gas
 @option_ignore_deployed
 @click.option('--confirmations', help="Number of required block confirmations", type=click.IntRange(min=0))
 @click.option('--parameters', help="Filepath to a JSON file containing additional deployment parameters",
               type=EXISTING_READABLE_FILE)
-def contracts(general_config, actor_options, bare, gas, ignore_deployed, confirmations, parameters):
+@click.option('--mode',
+              help="Deploy a contract following all steps ('full'), up to idle status ('idle'), "
+                   "or just the bare contract ('bare'). Defaults to 'full'",
+              type=click.Choice(['full', 'idle', 'bare'], case_sensitive=False),
+              default='full'
+              )
+@click.option('--activate', help="Activate a contract that is in idle mode", is_flag=True)
+def contracts(general_config, actor_options, mode, activate, gas, ignore_deployed, confirmations, parameters):
     """
     Compile and deploy contracts.
     """
@@ -373,6 +398,7 @@ def contracts(general_config, actor_options, bare, gas, ignore_deployed, confirm
 
     emitter = general_config.emitter
     ADMINISTRATOR, _, deployer_interface, local_registry = actor_options.create_actor(emitter)
+    chain_name = deployer_interface.client.chain_name
 
     deployment_parameters = {}
     if parameters:
@@ -383,47 +409,70 @@ def contracts(general_config, actor_options, bare, gas, ignore_deployed, confirm
     # Deploy Single Contract (Amend Registry)
     #
     contract_name = actor_options.contract_name
+    deployment_mode = constants.__getattr__(mode.upper())  # TODO: constant sorrow
     if contract_name:
         try:
-            contract_deployer = ADMINISTRATOR.deployers[contract_name]
+            contract_deployer_class = ADMINISTRATOR.deployers[contract_name]
         except KeyError:
             message = f"No such contract {contract_name}. Available contracts are {ADMINISTRATOR.deployers.keys()}"
             emitter.echo(message, color='red', bold=True)
             raise click.Abort()
 
+        if activate:
+            # For the moment, only StakingEscrow can be activated
+            staking_escrow_deployer = contract_deployer_class(registry=ADMINISTRATOR.registry,
+                                                              deployer_address=ADMINISTRATOR.deployer_address)
+            if contract_name != STAKING_ESCROW_CONTRACT_NAME or not staking_escrow_deployer.ready_to_activate:
+                raise click.BadOptionUsage(option_name="--activate",
+                                           message=f"You can only activate an idle instance of {STAKING_ESCROW_CONTRACT_NAME}")
+
+            click.confirm(f"Activate {STAKING_ESCROW_CONTRACT_NAME} at "
+                          f"{staking_escrow_deployer._get_deployed_contract().address}?", abort=True)
+
+            receipts = staking_escrow_deployer.activate()
+            for tx_name, receipt in receipts.items():
+                paint_receipt_summary(emitter=emitter,
+                                      receipt=receipt,
+                                      chain_name=chain_name,
+                                      transaction_type=tx_name)
+            return  # Exit
+
         # Deploy
         emitter.echo(f"Deploying {contract_name}")
-        if contract_deployer._upgradeable and not bare:
+        if contract_deployer_class._upgradeable and deployment_mode is not BARE:
             # NOTE: Bare deployments do not engage the proxy contract
-            secret = ADMINISTRATOR.collect_deployment_secret(deployer=contract_deployer)
+            secret = ADMINISTRATOR.collect_deployment_secret(deployer=contract_deployer_class)
             receipts, agent = ADMINISTRATOR.deploy_contract(contract_name=contract_name,
                                                             plaintext_secret=secret,
                                                             gas_limit=gas,
-                                                            bare=bare,
+                                                            deployment_mode=deployment_mode,
                                                             ignore_deployed=ignore_deployed,
-                                                            confirmations=confirmations)
+                                                            confirmations=confirmations,
+                                                            deployment_parameters=deployment_parameters)
         else:
             # Non-Upgradeable or Bare
             receipts, agent = ADMINISTRATOR.deploy_contract(contract_name=contract_name,
                                                             gas_limit=gas,
-                                                            bare=bare,
+                                                            deployment_mode=deployment_mode,
                                                             ignore_deployed=ignore_deployed,
                                                             confirmations=confirmations,
-                                                            deployment_parameters=deployment_parameters
-                                                            )
+                                                            deployment_parameters=deployment_parameters)
 
         # Report
         paint_contract_deployment(contract_name=contract_name,
                                   contract_address=agent.contract_address,
                                   receipts=receipts,
                                   emitter=emitter,
-                                  chain_name=deployer_interface.client.chain_name,
+                                  chain_name=chain_name,
                                   open_in_browser=actor_options.etherscan)
         return  # Exit
 
     #
     # Deploy Automated Series (Create Registry)
     #
+    if deployment_mode is not FULL:
+        raise click.BadOptionUsage(option_name='--mode',
+                                   message="Only 'full' mode is supported when deploying all network contracts")
 
     # Confirm filesystem registry writes.
     if os.path.isfile(local_registry.filepath):
@@ -535,7 +584,11 @@ def multisig(general_config, actor_options, action, proposal):
     # Init
     emitter = general_config.emitter
     _ensure_config_root(actor_options.config_root)
-    blockchain = _initialize_blockchain(actor_options.poa, actor_options.provider_uri, emitter)
+    blockchain = _initialize_blockchain(poa=actor_options.poa,
+                                        provider_uri=actor_options.provider_uri,
+                                        emitter=emitter,
+                                        ignore_solidity_check=actor_options.ignore_solididty_check,
+                                        gas_strategy=actor_options.gas_strategy)
     local_registry = establish_deployer_registry(emitter=emitter,
                                                  use_existing_registry=True,
                                                  )
@@ -606,3 +659,28 @@ def transfer_ownership(general_config, actor_options, target_address, gas):
     else:
         receipts = ADMINISTRATOR.relinquish_ownership(new_owner=target_address, transaction_gas_limit=gas)
         emitter.ipc(receipts, request_id=0, duration=0)  # TODO: #1216
+
+
+@deploy.command("set-range")
+@group_general_config
+@group_actor_options
+@click.option('--minimum', help="Minimum value for range (in wei)", type=WEI)
+@click.option('--default', help="Default value for range (in wei)", type=WEI)
+@click.option('--maximum', help="Maximum value for range (in wei)", type=WEI)
+def set_range(general_config, actor_options, minimum, default, maximum):
+    """
+    Set the allowed range for the minimum reward rate in the policy manager contract.
+    """
+    emitter = general_config.emitter
+    ADMINISTRATOR, _, _, _ = actor_options.create_actor(emitter)
+
+    if not minimum:
+        minimum = click.prompt("Enter new minimum value for range", type=click.IntRange(min=0))
+    if not default:
+        default = click.prompt("Enter new default value for range", type=click.IntRange(min=minimum))
+    if not maximum:
+        maximum = click.prompt("Enter new maximum value for range", type=click.IntRange(min=default))
+
+    ADMINISTRATOR.set_min_reward_rate_range(minimum=minimum, default=default, maximum=maximum)
+    emitter.echo(f"The minimum reward rate was limited to the range [{minimum}, {maximum}] "
+                 f"with the default value {default}")

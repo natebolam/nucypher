@@ -15,9 +15,7 @@ You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-import json
 import os
-from json import JSONDecodeError
 
 import click
 from constant_sorrow.constants import NO_BLOCKCHAIN_CONNECTION
@@ -31,7 +29,10 @@ from nucypher.cli.actions import (
     get_nucypher_password,
     select_client_account,
     get_client_password,
-    get_or_update_configuration)
+    get_or_update_configuration,
+    select_worker_config_file
+)
+from nucypher.cli.commands.deploy import option_gas_strategy
 from nucypher.cli.config import group_general_config
 from nucypher.cli.options import (
     group_options,
@@ -63,18 +64,14 @@ class UrsulaConfigOptions:
 
     __option_name__ = 'config_options'
 
-    def __init__(self, geth, provider_uri, staker_address, worker_address, federated_only, rest_host,
-            rest_port, db_filepath, network, registry_filepath, dev, poa, light):
+    def __init__(self, geth, provider_uri, worker_address, federated_only, rest_host,
+            rest_port, db_filepath, network, registry_filepath, dev, poa, light, gas_strategy):
 
         if federated_only:
             # TODO: consider rephrasing in a more universal voice.
             if geth:
                 raise click.BadOptionUsage(option_name="--geth",
                                            message="--geth cannot be used in federated mode.")
-
-            if staker_address:
-                raise click.BadOptionUsage(option_name='--staker-address',
-                                           message="--staker-address cannot be used in federated mode.")
 
             if registry_filepath:
                 raise click.BadOptionUsage(option_name="--registry-filepath",
@@ -88,7 +85,6 @@ class UrsulaConfigOptions:
 
         self.eth_node = eth_node
         self.provider_uri = provider_uri
-        self.staker_address = staker_address
         self.worker_address = worker_address
         self.federated_only = federated_only
         self.rest_host = rest_host
@@ -99,6 +95,7 @@ class UrsulaConfigOptions:
         self.dev = dev
         self.poa = poa
         self.light = light
+        self.gas_strategy = gas_strategy
 
     def create_config(self, emitter, config_file):
         if self.dev:
@@ -111,8 +108,8 @@ class UrsulaConfigOptions:
                 registry_filepath=self.registry_filepath,
                 provider_process=self.eth_node,
                 provider_uri=self.provider_uri,
-                checksum_address=self.staker_address,
-                worker_address=self.worker_address,
+                gas_strategy=self.gas_strategy,
+                checksum_address=self.worker_address,
                 federated_only=self.federated_only,
                 rest_host=self.rest_host,
                 rest_port=self.rest_port,
@@ -126,6 +123,7 @@ class UrsulaConfigOptions:
                     registry_filepath=self.registry_filepath,
                     provider_process=self.eth_node,
                     provider_uri=self.provider_uri,
+                    gas_strategy=self.gas_strategy,
                     rest_host=self.rest_host,
                     rest_port=self.rest_port,
                     db_filepath=self.db_filepath,
@@ -144,12 +142,8 @@ class UrsulaConfigOptions:
 
         assert not self.dev  # TODO: Raise instead
 
-        staker_address = self.staker_address
         worker_address = self.worker_address
-        if (not staker_address or not worker_address) and not self.federated_only:
-            if not staker_address:
-                staker_address = click.prompt("Enter staker address", type=EIP55_CHECKSUM_ADDRESS)
-
+        if (not worker_address) and not self.federated_only:
             if not worker_address:
                 prompt = "Select worker account"
                 worker_address = select_client_account(emitter=emitter,
@@ -172,11 +166,11 @@ class UrsulaConfigOptions:
                                             db_filepath=self.db_filepath,
                                             domains=self.domains,
                                             federated_only=self.federated_only,
-                                            checksum_address=staker_address,
                                             worker_address=worker_address,
                                             registry_filepath=self.registry_filepath,
                                             provider_process=self.eth_node,
                                             provider_uri=self.provider_uri,
+                                            gas_strategy=self.gas_strategy,
                                             poa=self.poa,
                                             light=self.light)
 
@@ -186,10 +180,10 @@ class UrsulaConfigOptions:
                        db_filepath=self.db_filepath,
                        domains=self.domains,
                        federated_only=self.federated_only,
-                       checksum_address=self.staker_address,
-                       worker_address=self.worker_address,
+                       checksum_address=self.worker_address,
                        registry_filepath=self.registry_filepath,
                        provider_uri=self.provider_uri,
+                       gas_strategy=self.gas_strategy,
                        poa=self.poa,
                        light=self.light)
         # Depends on defaults being set on Configuration classes, filtrates None values
@@ -201,7 +195,7 @@ group_config_options = group_options(
     UrsulaConfigOptions,
     geth=option_geth,
     provider_uri=option_provider_uri(),
-    staker_address=click.option('--staker-address', help="Run on behalf of a specified staking account", type=EIP55_CHECKSUM_ADDRESS),
+    gas_strategy=option_gas_strategy,
     worker_address=click.option('--worker-address', help="Run the worker-ursula with a specified address", type=EIP55_CHECKSUM_ADDRESS),
     federated_only=option_federated_only,
     rest_host=click.option('--rest-host', help="The host IP address to run Ursula network services on", type=click.STRING),
@@ -244,7 +238,6 @@ class UrsulaCharacterOptions:
                                                 client_password=client_password,
                                                 load_preferred_teachers=load_seednodes and not self.lonely,
                                                 start_learning_now=load_seednodes)
-
             return ursula_config, URSULA
 
         except NucypherKeyring.AuthenticationFailed as e:
@@ -334,11 +327,24 @@ def run(general_config, character_options, config_file, interactive, dry_run, me
     # Setup
     #
 
-    emitter = _setup_emitter(general_config, character_options.config_options.worker_address)
+    worker_address = character_options.config_options.worker_address
+    emitter = _setup_emitter(general_config, worker_address=worker_address)
     _pre_launch_warnings(emitter, dev=character_options.config_options.dev, force=None)
-    ursula_config, URSULA = character_options.create_character(emitter=emitter,
-                                                               config_file=config_file,
-                                                               json_ipc=general_config.json_ipc)
+
+    domains = character_options.config_options.domains
+    if not character_options.config_options.dev:
+        config_file = select_worker_config_file(emitter=emitter,
+                                                config_file=config_file,
+                                                worker_address=worker_address,
+                                                network=list(domains)[0] if domains else None,
+                                                provider_uri=character_options.config_options.provider_uri,
+                                                federated=character_options.config_options.federated_only)
+
+    ursula_config, URSULA = character_options.create_character(
+            emitter=emitter,
+            config_file=config_file,
+            json_ipc=general_config.json_ipc
+    )
 
     #
     # Additional Services
