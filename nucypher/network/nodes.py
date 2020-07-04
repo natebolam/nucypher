@@ -15,50 +15,39 @@ You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import binascii
 import contextlib
 import random
-from collections import defaultdict, OrderedDict
-from collections import deque
-from collections import namedtuple
+from collections import OrderedDict, defaultdict, deque, namedtuple
 from contextlib import suppress
-from typing import Set, Tuple, Union
 
+import binascii
 import maya
 import requests
 import time
-from bytestring_splitter import BytestringSplitter, PartiallyKwargifiedBytes
-from bytestring_splitter import VariableLengthBytestring, BytestringSplittingError
+from bytestring_splitter import BytestringSplitter, BytestringSplittingError, PartiallyKwargifiedBytes, \
+    VariableLengthBytestring
 from constant_sorrow import constant_or_bytes
-from constant_sorrow.constants import (
-    NO_KNOWN_NODES,
-    NOT_SIGNED,
-    NEVER_SEEN,
-    NO_STORAGE_AVAILIBLE,
-    FLEET_STATES_MATCH,
-    CERTIFICATE_NOT_SAVED,
-    UNKNOWN_FLEET_STATE
-)
+from constant_sorrow.constants import (CERTIFICATE_NOT_SAVED, FLEET_STATES_MATCH, NEVER_SEEN, NOT_SIGNED,
+                                       NO_KNOWN_NODES, NO_STORAGE_AVAILIBLE, UNKNOWN_FLEET_STATE)
 from cryptography.x509 import Certificate
 from eth_utils import to_checksum_address
 from requests.exceptions import SSLError
-from twisted.internet import reactor, defer
-from twisted.internet import task
+from twisted.internet import defer, reactor, task
 from twisted.internet.threads import deferToThread
 from twisted.logger import Logger
-
-import nucypher
+from typing import Set, Tuple, Union
 from umbral.signing import Signature
 
+import nucypher
 from nucypher.blockchain.economics import EconomicsFactory
 from nucypher.blockchain.eth.agents import ContractAgency, StakingEscrowAgent
-from nucypher.blockchain.eth.interfaces import BlockchainInterface
+from nucypher.blockchain.eth.constants import NULL_ADDRESS
 from nucypher.blockchain.eth.registry import BaseContractRegistry
 from nucypher.config.constants import SeednodeMetadata
 from nucypher.config.storages import ForgetfulNodeStorage
-from nucypher.crypto.api import keccak_digest, verify_eip_191, recover_address_eip_191
+from nucypher.crypto.api import keccak_digest, recover_address_eip_191, verify_eip_191
 from nucypher.crypto.kits import UmbralMessageKit
-from nucypher.crypto.powers import TransactingPower, SigningPower, DecryptingPower, NoSigningPower
+from nucypher.crypto.powers import DecryptingPower, NoSigningPower, SigningPower, TransactingPower
 from nucypher.crypto.signing import signature_splitter
 from nucypher.network import LEARNING_LOOP_VERSION
 from nucypher.network.exceptions import NodeSeemsToBeDown
@@ -116,8 +105,6 @@ class FleetStateTracker:
         if self._tracking:
             self.log.info("Updating fleet state after saving node {}".format(value))
             self.record_fleet_state()
-        else:
-            self.log.debug("Not updating fleet state.")
 
     def __getitem__(self, item):
         return self._nodes[item]
@@ -239,17 +226,17 @@ class NodeSprout(PartiallyKwargifiedBytes):
 
     def __init__(self, node_metadata):
         super().__init__(node_metadata)
-        self.checksum_address = to_checksum_address(node_metadata['public_address'][0])
+        self.checksum_address = to_checksum_address(self.public_address)
         self.nickname = nickname_from_seed(self.checksum_address)[0]
-        self.timestamp = maya.MayaDT(int.from_bytes(node_metadata['timestamp'][0], byteorder="big"))
-        self._hash = int.from_bytes(bytes(node_metadata['verifying_key'][0]), byteorder="big")
+        self.timestamp = maya.MayaDT(self.timestamp)  # Weird for this to be in init. maybe this belongs in the splitter also.
+        self._hash = int.from_bytes(self.public_address, byteorder="big")  # stop-propagation logic (ie, only propagate verified, staked nodes) keeps this unique and BFT.
+        self._repr = f"({self.__class__.__name__})⇀{self.nickname}↽ ({self.checksum_address})"
 
     def __hash__(self):
         return self._hash
 
     def __repr__(self):
-        r = f"({self.__class__.__name__})⇀{self.nickname}↽ ({self.checksum_address})"
-        return r
+        return self._repr
 
     def __bytes__(self):
         b = super().__bytes__()
@@ -273,6 +260,7 @@ class NodeSprout(PartiallyKwargifiedBytes):
 
         self.__class__ = mature_node.__class__
         self.__dict__ = mature_node.__dict__
+        return self  # To reduce the awkwardity of renaming; this is always the weird part of polymorphism for me.
 
 
 class Learner:
@@ -323,7 +311,7 @@ class Learner:
     def __init__(self,
                  domains: set,
                  node_class: object = None,
-                 network_middleware: RestMiddleware = __DEFAULT_MIDDLEWARE_CLASS(),
+                 network_middleware: RestMiddleware = None,
                  start_learning_now: bool = False,
                  learn_on_same_thread: bool = False,
                  known_nodes: tuple = None,
@@ -337,7 +325,11 @@ class Learner:
         self.log = Logger("learning-loop")  # type: Logger
 
         self.learning_domains = domains
-        self.network_middleware = network_middleware
+        if not self.federated_only:
+            default_middleware = self.__DEFAULT_MIDDLEWARE_CLASS(registry=self.registry)
+        else:
+            default_middleware = self.__DEFAULT_MIDDLEWARE_CLASS()
+        self.network_middleware = network_middleware or default_middleware
         self.save_metadata = save_metadata
         self.start_learning_now = start_learning_now
         self.learn_on_same_thread = learn_on_same_thread
@@ -431,8 +423,7 @@ class Learner:
                       node,
                       force_verification_recheck=False,
                       record_fleet_state=True,
-                      eager: bool = False,
-                      grow_node_sprout_into_node=False):
+                      eager: bool = False):
 
         # UNPARSED
         # PARSED
@@ -457,30 +448,17 @@ class Learner:
         if self.save_metadata:
             self.node_storage.store_node_metadata(node=node)
 
-        try:
-            stranger_certificate = node.certificate
-        except AttributeError:
-            # Probably a sprout.
-            try:
-                if grow_node_sprout_into_node:
-                    node.mature()
-                    stranger_certificate = node.certificate
-                else:
-                    # TODO: Well, why?  What about eagerness, popping listeners, etc?  We not doing that stuff? NRN
-                    return node
-            except Exception as e:
-                # Whoops, we got an Alice, Bob, or something totally wrong...
-                raise self.NotATeacher(f"{node.__class__.__name__} does not have a certificate and cannot be remembered.")
-
-        # Store node's certificate - It has been seen.
-        certificate_filepath = self.node_storage.store_node_certificate(certificate=stranger_certificate)
-
-        # In some cases (seed nodes or other temp stored certs),
-        # this will update the filepath from the temp location to this one.
-        node.certificate_filepath = certificate_filepath
-
-        self.log.info(f"Saved TLS certificate for {node.nickname}: {certificate_filepath}")
         if eager:
+            node.mature()
+            stranger_certificate = node.certificate
+
+            # Store node's certificate - It has been seen.
+            certificate_filepath = self.node_storage.store_node_certificate(certificate=stranger_certificate)
+
+            # In some cases (seed nodes or other temp stored certs),
+            # this will update the filepath from the temp location to this one.
+            node.certificate_filepath = certificate_filepath
+
             try:
                 node.verify_node(force=force_verification_recheck,
                                  network_middleware_client=self.network_middleware.client,
@@ -503,8 +481,6 @@ class Learner:
 
         listeners = self._learning_listeners.pop(node.checksum_address, tuple())
 
-        self.log.info(
-            "Remembering {} ({}), popping {} listeners.".format(node.nickname, node.checksum_address, len(listeners)))
         for listener in listeners:
             listener.add(node.checksum_address)
         self._node_ids_to_learn_about_immediately.discard(node.checksum_address)
@@ -551,7 +527,8 @@ class Learner:
         """
         Only for tests at this point.  Maybe some day for graceful shutdowns.
         """
-        self._learning_task.stop()
+        if self._learning_task.running:
+            self._learning_task.stop()
 
     def handle_learning_errors(self, *args, **kwargs):
         failure = args[0]
@@ -659,7 +636,8 @@ class Learner:
 
             # The rest of the fucking owl
             round_finish = maya.now()
-            if (round_finish - start).seconds > timeout:
+            elapsed = (round_finish - start).seconds
+            if elapsed > timeout:
                 if not self._learning_task.running:
                     raise RuntimeError("Learning loop is not running.  Start it with start_learning().")
                 elif not reactor.running and not learn_on_this_thread:
@@ -815,6 +793,12 @@ class Learner:
             unresponsive_nodes.add(current_teacher)
             self.log.info("Bad Response from teacher: {}:{}.".format(current_teacher, e))
             return
+        except current_teacher.InvalidNode as e:
+            # Ugh.  The teacher is invalid.  Rough.
+            # TODO: Bucket separately and report.
+            unresponsive_nodes.add(current_teacher)
+            self.log.info("Teacher is invalid: {}:{}.".format(current_teacher, e))
+            return
 
         finally:
             # Is cycling happening in the right order?
@@ -883,8 +867,7 @@ class Learner:
                 node_or_false = self.remember_node(sprout,
                                                    record_fleet_state=False,
                                                    # Do we want both of these to be decided by `eager`?
-                                                   eager=eager,
-                                                   grow_node_sprout_into_node=eager)
+                                                   eager=eager)
                 if node_or_false is not False:
                     remembered.append(node_or_false)
 
@@ -909,7 +892,7 @@ class Learner:
                 self.log.warn(f'Verification Failed - '
                               f'{sprout} has an invalid wallet signature for {sprout.decentralized_identity_evidence}')
 
-            except sprout.DetachedWorker:
+            except sprout.UnbondedWorker:
                 self.log.warn(f'Verification Failed - '
                               f'{sprout} is not bonded to a Staker.')
 
@@ -1001,7 +984,7 @@ class Teacher:
     class NotStaking(InvalidStamp):
         """Raised when a node fails verification because it is not currently staking"""
 
-    class DetachedWorker(InvalidNode):
+    class UnbondedWorker(InvalidNode):
         """Raised when a node fails verification because it is not bonded to a Staker"""
 
     class WrongMode(TypeError):
@@ -1018,6 +1001,8 @@ class Teacher:
         """
         This is the most mature form, so we do nothing.
         """
+        return self
+
     @classmethod
     def set_federated_mode(cls, federated_only: bool):
         cls._federated_only_instances = federated_only
@@ -1032,13 +1017,15 @@ class Teacher:
     # Known Nodes
     #
 
-    def seed_node_metadata(self, as_teacher_uri=False):
+    def seed_node_metadata(self, as_teacher_uri=False) -> SeednodeMetadata:
         if as_teacher_uri:
             teacher_uri = f'{self.checksum_address}@{self.rest_server.rest_interface.host}:{self.rest_server.rest_interface.port}'
             return teacher_uri
-        return SeednodeMetadata(self.checksum_address,  # type: str
-                                self.rest_server.rest_interface.host,  # type: str
-                                self.rest_server.rest_interface.port)  # type: int
+        return SeednodeMetadata(
+            self.checksum_address,
+            self.rest_server.rest_interface.host,
+            self.rest_server.rest_interface.port
+        )
 
     def sorted_nodes(self):
         nodes_to_consider = list(self.known_nodes.values()) + [self]
@@ -1093,15 +1080,15 @@ class Teacher:
     def _worker_is_bonded_to_staker(self, registry: BaseContractRegistry) -> bool:
         """
         This method assumes the stamp's signature is valid and accurate.
-        As a follow-up, this checks that the worker is linked to a staker, but it may be
+        As a follow-up, this checks that the worker is bonded to a staker, but it may be
         the case that the "staker" isn't "staking" (e.g., all her tokens have been slashed).
         """
         # Lazy agent get or create
         staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=registry)
 
         staker_address = staking_agent.get_staker_from_worker(worker_address=self.worker_address)
-        if staker_address == BlockchainInterface.NULL_ADDRESS:
-            raise self.DetachedWorker(f"Worker {self.worker_address} is detached")
+        if staker_address == NULL_ADDRESS:
+            raise self.UnbondedWorker(f"Worker {self.worker_address} is not bonded")
         return staker_address == self.checksum_address
 
     def _staker_is_really_staking(self, registry: BaseContractRegistry) -> bool:
@@ -1148,7 +1135,8 @@ class Teacher:
             if registry:
                 if not self._worker_is_bonded_to_staker(registry=registry):  # <-- Blockchain CALL
                     message = f"Worker {self.worker_address} is not bonded to staker {self.checksum_address}"
-                    raise self.DetachedWorker(message)
+                    self.log.debug(message)
+                    raise self.UnbondedWorker(message)
 
                 if self._staker_is_really_staking(registry=registry):  # <-- Blockchain CALL
                     self.verified_worker = True
@@ -1208,27 +1196,30 @@ class Teacher:
                            "on-chain Staking verification will not be performed.")
 
         # This is both the stamp's client signature and interface metadata check; May raise InvalidNode
-        self.validate_metadata(registry=registry)
+        try:
+            self.validate_metadata(registry=registry)
+        except self.UnbondedWorker:
+            self.verified_node = False
+            return False
 
         # The node's metadata is valid; let's be sure the interface is in order.
         if not certificate_filepath:
             if self.certificate_filepath is CERTIFICATE_NOT_SAVED:
-                raise TypeError("We haven't saved a certificate for this node yet.")
-            else:
-                certificate_filepath = self.certificate_filepath
+                self.certificate_filepath = self._cert_store_function(self.certificate)
+            certificate_filepath = self.certificate_filepath
 
         response_data = network_middleware_client.node_information(host=self.rest_interface.host,
-                                                            port=self.rest_interface.port,
-                                                            certificate_filepath=certificate_filepath)
+                                                                   port=self.rest_interface.port,
+                                                                   certificate_filepath=certificate_filepath)
 
         version, node_bytes = self.version_splitter(response_data, return_remainder=True)
 
         sprout = self.internal_splitter(node_bytes, partial=True)
 
-        verifying_keys_match = sprout['verifying_key'] == self.public_keys(SigningPower)
-        encrypting_keys_match = sprout['encrypting_key'] == self.public_keys(DecryptingPower)
-        addresses_match = sprout['public_address'] == self.canonical_public_address
-        evidence_matches = sprout['decentralized_identity_evidence'] == self.__decentralized_identity_evidence
+        verifying_keys_match = sprout.verifying_key == self.public_keys(SigningPower)
+        encrypting_keys_match = sprout.encrypting_key == self.public_keys(DecryptingPower)
+        addresses_match = sprout.public_address == self.canonical_public_address
+        evidence_matches = sprout.decentralized_identity_evidence == self.__decentralized_identity_evidence
 
         if not all((encrypting_keys_match, verifying_keys_match, addresses_match, evidence_matches)):
             # Failure
@@ -1386,6 +1377,6 @@ class Teacher:
         if not self.federated_only:
             payload.update({
                 "balances": dict(eth=float(self.eth_balance), nu=float(self.token_balance.to_tokens())),
-                "missing_confirmations": self.missing_confirmations,
-                "last_active_period": self.last_active_period})
+                "missing_commitments": self.missing_commitments,
+                "last_committed_period": self.last_committed_period})
         return payload

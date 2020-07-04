@@ -1,79 +1,138 @@
 """
-This file is part of nucypher.
+ This file is part of nucypher.
 
-nucypher is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
 
-nucypher is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
 
-You should have received a copy of the GNU Affero General Public License
-along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
-
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import click
+import maya
+import os
+import tabulate
 from decimal import Decimal
 from web3 import Web3
 
 from nucypher.blockchain.eth.actors import Bidder
 from nucypher.blockchain.eth.agents import ContractAgency, WorkLockAgent
+from nucypher.blockchain.eth.signers import Signer, ClefSigner
 from nucypher.blockchain.eth.token import NU
 from nucypher.blockchain.eth.utils import prettify_eth_amount
-from nucypher.characters.banners import WORKLOCK_BANNER
-from nucypher.cli.actions import select_client_account
-from nucypher.cli.commands.status import group_registry_options
-from nucypher.cli.config import group_general_config
+from nucypher.cli.actions.auth import get_client_password
+from nucypher.cli.actions.select import select_client_account
+from nucypher.cli.utils import connect_to_blockchain, get_registry, setup_emitter
+from nucypher.cli.config import group_general_config, GroupGeneralConfig
+from nucypher.cli.literature import (
+    AVAILABLE_CLAIM_NOTICE,
+    BID_AMOUNT_PROMPT_WITH_MIN_BID,
+    BID_INCREASE_AMOUNT_PROMPT,
+    BIDDERS_ALREADY_VERIFIED,
+    BIDDING_WINDOW_CLOSED,
+    BIDS_VALID_NO_FORCE_REFUND_INDICATED,
+    CANCELLATION_WINDOW_CLOSED,
+    CLAIM_ALREADY_PLACED,
+    CLAIMING_NOT_AVAILABLE,
+    COMPLETED_BID_VERIFICATION,
+    CONFIRM_BID_VERIFICATION,
+    CONFIRM_COLLECT_WORKLOCK_REFUND,
+    CONFIRM_REQUEST_WORKLOCK_COMPENSATION,
+    CONFIRM_WORKLOCK_CLAIM,
+    EXISTING_BID_AMOUNT_NOTICE,
+    PROMPT_BID_VERIFY_GAS_LIMIT,
+    REQUESTING_WORKLOCK_COMPENSATION,
+    SUBMITTING_WORKLOCK_CLAIM,
+    SUBMITTING_WORKLOCK_REFUND_REQUEST,
+    SUCCESSFUL_BID_CANCELLATION,
+    VERIFICATION_ESTIMATES,
+    WHALE_WARNING,
+    WORKLOCK_ADDITIONAL_COMPENSATION_AVAILABLE,
+    WORKLOCK_CLAIM_ADVISORY
+)
 from nucypher.cli.options import (
-    option_force,
     group_options,
-    option_checksum_address,
-    option_hw_wallet
+    option_force,
+    option_hw_wallet,
+    option_network,
+    option_provider_uri,
+    option_registry_filepath,
+    option_signer_uri
 )
-from nucypher.cli.actions import get_client_password
-from nucypher.cli.painting import (
-    paint_receipt_summary,
-    paint_worklock_status,
-    paint_bidding_notice,
+from nucypher.cli.painting.transactions import paint_receipt_summary
+from nucypher.cli.painting.worklock import (
     paint_bidder_status,
-    paint_worklock_claim
+    paint_bidding_notice,
+    paint_worklock_claim,
+    paint_worklock_status
 )
-from nucypher.cli.types import EIP55_CHECKSUM_ADDRESS
+from nucypher.cli.types import DecimalRange, EIP55_CHECKSUM_ADDRESS
+from nucypher.config.constants import NUCYPHER_ENVVAR_PROVIDER_URI
 
 option_bidder_address = click.option('--bidder-address',
                                      help="Bidder's checksum address.",
                                      type=EIP55_CHECKSUM_ADDRESS)
 
 
-def _setup_emitter(general_config):
-    emitter = general_config.emitter
-    emitter.banner(WORKLOCK_BANNER)
-    return emitter
-
-
 class WorkLockOptions:
 
     __option_name__ = 'worklock_options'
 
-    def __init__(self, bidder_address: str):
-        self.bidder_address = bidder_address
+    def __init__(self,
+                 bidder_address: str,
+                 signer_uri: str,
+                 provider_uri: str,
+                 registry_filepath: str,
+                 network: str):
 
-    def __create_bidder(self, registry, transacting: bool = False, hw_wallet: bool = False):
+        self.bidder_address = bidder_address
+        self.signer_uri = signer_uri
+        self.provider_uri = provider_uri
+        self.registry_filepath = registry_filepath
+        self.network = network
+
+    def setup(self, general_config) -> tuple:
+        emitter = setup_emitter(general_config)   # TODO: Restore Banner:  network=self.network.capitalize()
+        registry = get_registry(network=self.network, registry_filepath=self.registry_filepath)
+        blockchain = connect_to_blockchain(emitter=emitter, provider_uri=self.provider_uri)
+        return emitter, registry, blockchain
+
+    def get_bidder_address(self, emitter, registry):
+        if not self.bidder_address:
+            self.bidder_address = select_client_account(emitter=emitter,
+                                                        provider_uri=self.provider_uri,
+                                                        signer_uri=self.signer_uri,
+                                                        network=self.network,
+                                                        registry=registry,
+                                                        show_eth_balance=True)
+        return self.bidder_address
+
+    def __create_bidder(self,
+                        registry,
+                        transacting: bool = True,
+                        hw_wallet: bool = False) -> Bidder:
+
         client_password = None
-        if transacting and not hw_wallet:
+        is_clef = ClefSigner.is_valid_clef_uri(self.signer_uri)
+        if transacting and not is_clef and not hw_wallet:
             client_password = get_client_password(checksum_address=self.bidder_address)
+        signer = Signer.from_signer_uri(self.signer_uri) if self.signer_uri else None
         bidder = Bidder(checksum_address=self.bidder_address,
                         registry=registry,
                         client_password=client_password,
-                        is_transacting=transacting)
+                        signer=signer,
+                        transacting=transacting)
         return bidder
 
     def create_bidder(self, registry, hw_wallet: bool = False):
-        return self.__create_bidder(registry, transacting=True, hw_wallet=hw_wallet)
+        return self.__create_bidder(registry=registry, hw_wallet=hw_wallet, transacting=True)
 
     def create_transactionless_bidder(self, registry):
         return self.__create_bidder(registry, transacting=False)
@@ -81,105 +140,115 @@ class WorkLockOptions:
 
 group_worklock_options = group_options(
     WorkLockOptions,
-    bidder_address=option_bidder_address)
+    bidder_address=option_bidder_address,
+    signer_uri=option_signer_uri,
+    provider_uri=option_provider_uri(required=True, default=os.environ.get(NUCYPHER_ENVVAR_PROVIDER_URI)),
+    network=option_network(required=True),
+    registry_filepath=option_registry_filepath,
+)
 
 
 @click.group()
 def worklock():
-    """
-    Participate in NuCypher's WorkLock to obtain NU tokens
-    """
-    pass
+    """Participate in NuCypher's WorkLock to obtain NU tokens"""
 
 
 @worklock.command()
-@group_registry_options
 @group_worklock_options
 @group_general_config
-def status(general_config, registry_options, worklock_options):
+def status(general_config: GroupGeneralConfig, worklock_options: WorkLockOptions):
     """Show current WorkLock information"""
-
-    emitter = _setup_emitter(general_config)
-    registry = registry_options.get_registry(emitter, general_config.debug)
+    emitter, registry, blockchain = worklock_options.setup(general_config=general_config)
     paint_worklock_status(emitter=emitter, registry=registry)
     if worklock_options.bidder_address:
         bidder = worklock_options.create_transactionless_bidder(registry=registry)
         paint_bidder_status(emitter=emitter, bidder=bidder)
-    return  # Exit
 
 
 @worklock.command()
 @group_general_config
-@group_registry_options
 @group_worklock_options
 @option_force
 @option_hw_wallet
-@click.option('--value', help="ETH value of bid", type=click.STRING)
-def bid(general_config, worklock_options, registry_options, force, hw_wallet, value):
-    """Place a bid"""
-    emitter = _setup_emitter(general_config)
+@click.option('--value', help="ETH value of bid", type=DecimalRange(min=0))
+def bid(general_config: GroupGeneralConfig,
+        worklock_options: WorkLockOptions,
+        force: bool,
+        hw_wallet: bool,
+        value: Decimal):
+    """Place a bid, or increase an existing bid"""
+    emitter, registry, blockchain = worklock_options.setup(general_config=general_config)
+    worklock_agent = ContractAgency.get_agent(WorkLockAgent, registry=registry)  # type: WorkLockAgent
+    now = maya.now().epoch
+    if not worklock_agent.start_bidding_date <= now <= worklock_agent.end_bidding_date:
+        emitter.echo(BIDDING_WINDOW_CLOSED, color='red')
+        raise click.Abort()
 
-    if not worklock_options.bidder_address:
-        worklock_options.bidder_address = select_client_account(emitter=emitter,
-                                                                provider_uri=registry_options.provider_uri,
-                                                                network=registry_options.network,
-                                                                show_balances=True)
+    _bidder_address = worklock_options.get_bidder_address(emitter, registry)
+    bidder = worklock_options.create_bidder(registry=registry, hw_wallet=hw_wallet)
+
+    existing_bid_amount = bidder.get_deposited_eth
     if not value:
         if force:
             raise click.MissingParameter("Missing --value.")
-        value = click.prompt("Enter bid amount in ETH", type=click.STRING)
+
+        if not existing_bid_amount:  # It's the first bid
+            minimum_bid = bidder.worklock_agent.minimum_allowed_bid
+            minimum_bid_in_eth = Web3.fromWei(minimum_bid, 'ether')
+            prompt = BID_AMOUNT_PROMPT_WITH_MIN_BID.format(minimum_bid_in_eth=minimum_bid_in_eth)
+        else:  # There's an existing bid and the bidder is increasing the amount
+            emitter.message(EXISTING_BID_AMOUNT_NOTICE.format(eth_amount=Web3.fromWei(existing_bid_amount, 'ether')))
+            minimum_bid_in_eth = Web3.fromWei(1, 'ether')
+            prompt = BID_INCREASE_AMOUNT_PROMPT
+        value = click.prompt(prompt, type=DecimalRange(min=minimum_bid_in_eth))
+
     value = int(Web3.toWei(Decimal(value), 'ether'))
 
-    registry = registry_options.get_registry(emitter, general_config.debug)
-    bidder = worklock_options.create_bidder(registry=registry, hw_wallet=hw_wallet)
-
     if not force:
-        paint_bidding_notice(emitter=emitter, bidder=bidder)
-        click.confirm(f"Place WorkLock bid of {prettify_eth_amount(value)}?", abort=True)
+        if not existing_bid_amount:
+            paint_bidding_notice(emitter=emitter, bidder=bidder)
+            click.confirm(f"Place WorkLock bid of {prettify_eth_amount(value)}?", abort=True)
+        else:
+            click.confirm(f"Increase current bid ({prettify_eth_amount(existing_bid_amount)}) "
+                          f"by {prettify_eth_amount(value)}?", abort=True)
 
     receipt = bidder.place_bid(value=value)
     emitter.message("Publishing WorkLock Bid...")
 
-    # Ensure the total bid value is worth a claim that is at
-    # least large enough for the minimum stake.
-    minimum = bidder.economics.minimum_allowed_locked
+    maximum = NU.from_nunits(bidder.economics.maximum_allowed_locked)
     available_claim = NU.from_nunits(bidder.available_claim)
-    if available_claim < minimum:
-        warning = f"Total bid ({available_claim}) is too small for a claim, please bid more or cancel.\n" \
-                  f"Total must be worth at least {NU.from_nunits(minimum)})."
-        emitter.echo(warning, color='yellow')
-    else:
-        message = f'Current bid: {prettify_eth_amount(bidder.get_deposited_eth)} | ' \
-                  f'Available claim: {available_claim}\n' \
-                  f'Note that available claim value may fluctuate until bidding closes and claims are finalized.\n'
-        emitter.echo(message, color='yellow')
+    message = f'\nCurrent bid: {prettify_eth_amount(bidder.get_deposited_eth)} | Claim: {available_claim}\n'
+    if available_claim > maximum:
+        message += f"\nThis claim is currently above the allowed max ({maximum}), " \
+                   f"so the bid may be partially refunded.\n"
+    message += f'Note that available claim value may fluctuate until bidding closes and claims are finalized.\n'
+    emitter.echo(message, color='yellow')
 
     paint_receipt_summary(receipt=receipt, emitter=emitter, chain_name=bidder.staking_agent.blockchain.client.chain_name)
-    return  # Exit
 
 
 @worklock.command()
 @group_general_config
-@group_registry_options
 @group_worklock_options
 @option_force
 @option_hw_wallet
-def cancel_bid(general_config, registry_options, worklock_options, force, hw_wallet):
-    """Cancel your bid"""
-    emitter = _setup_emitter(general_config)
-    if not worklock_options.bidder_address:  # TODO: Consider bundle this in worklock_options
-        worklock_options.bidder_address = select_client_account(emitter=emitter,
-                                                                provider_uri=registry_options.provider_uri,
-                                                                network=registry_options.network,
-                                                                show_balances=True)
-    registry = registry_options.get_registry(emitter, general_config.debug)
+def cancel_bid(general_config: GroupGeneralConfig, worklock_options: WorkLockOptions, force: bool, hw_wallet: bool):
+    """Cancel your bid and receive your ETH back"""
+    emitter, registry, blockchain = worklock_options.setup(general_config=general_config)
+    worklock_agent = ContractAgency.get_agent(WorkLockAgent, registry=registry)  # type: WorkLockAgent
+    now = maya.now().epoch
+    if not worklock_agent.start_bidding_date <= now <= worklock_agent.end_cancellation_date:
+        emitter.echo(CANCELLATION_WINDOW_CLOSED, color='red')
+        raise click.Abort()
+
+    bidder_address = worklock_options.get_bidder_address(emitter, registry)
+
     bidder = worklock_options.create_bidder(registry=registry, hw_wallet=hw_wallet)
     if not force:
         value = bidder.get_deposited_eth
-        click.confirm(f"Confirm bid cancellation of {prettify_eth_amount(value)}"
-                      f" for {worklock_options.bidder_address}?", abort=True)
+        click.confirm(f"Confirm bid cancellation of {prettify_eth_amount(value)} for {bidder_address}?", abort=True)
     receipt = bidder.cancel_bid()
-    emitter.echo("Bid canceled\n", color='green')
+    emitter.echo(SUCCESSFUL_BID_CANCELLATION, color='green')
     paint_receipt_summary(receipt=receipt, emitter=emitter, chain_name=bidder.staking_agent.blockchain.client.chain_name)
     return  # Exit
 
@@ -187,90 +256,145 @@ def cancel_bid(general_config, registry_options, worklock_options, force, hw_wal
 @worklock.command()
 @option_force
 @option_hw_wallet
-@group_registry_options
 @group_worklock_options
 @group_general_config
-def claim(general_config, worklock_options, registry_options, force, hw_wallet):
-    """Claim tokens for a successful bid, and start staking them"""
-    emitter = _setup_emitter(general_config)
-    if not worklock_options.bidder_address:
-        worklock_options.bidder_address = select_client_account(emitter=emitter,
-                                                                provider_uri=registry_options.provider_uri,
-                                                                network=registry_options.network,
-                                                                show_balances=True)
+def claim(general_config: GroupGeneralConfig, worklock_options: WorkLockOptions, force: bool, hw_wallet: bool):
+    """Claim tokens for your bid, and start staking them"""
+    emitter, registry, blockchain = worklock_options.setup(general_config=general_config)
+    worklock_agent = ContractAgency.get_agent(WorkLockAgent, registry=registry)  # type: WorkLockAgent
+    if not worklock_agent.is_claiming_available():
+        emitter.echo(CLAIMING_NOT_AVAILABLE, color='red')
+        raise click.Abort()
 
-    # TODO: Show amount of tokens to claim
-
-    if not force:
-        emitter.echo("Note: Claiming WorkLock NU tokens will initialize a new stake.", color='blue')
-        click.confirm(f"Continue worklock claim for bidder {worklock_options.bidder_address}?", abort=True)
-    emitter.message("Submitting Claim...")
-    registry = registry_options.get_registry(emitter, general_config.debug)
+    bidder_address = worklock_options.get_bidder_address(emitter, registry)
     bidder = worklock_options.create_bidder(registry=registry, hw_wallet=hw_wallet)
+
+    unspent_bid = bidder.available_compensation
+    if unspent_bid:
+        emitter.echo(WORKLOCK_ADDITIONAL_COMPENSATION_AVAILABLE.format(amount=prettify_eth_amount(unspent_bid)))
+        if not force:
+            message = CONFIRM_REQUEST_WORKLOCK_COMPENSATION.format(bidder_address=bidder_address)
+            click.confirm(message, abort=True)
+        emitter.echo(REQUESTING_WORKLOCK_COMPENSATION)
+        receipt = bidder.withdraw_compensation()
+        paint_receipt_summary(receipt=receipt, emitter=emitter, chain_name=bidder.staking_agent.blockchain.client.chain_name)
+
+    has_claimed = bidder.has_claimed
+    if bool(has_claimed):
+        emitter.echo(CLAIM_ALREADY_PLACED.format(bidder_address=bidder.checksum_address), color='red')
+        raise click.Abort()
+
+    tokens = NU.from_nunits(bidder.available_claim)
+    emitter.echo(AVAILABLE_CLAIM_NOTICE.format(tokens=tokens), color='green', bold=True)
+    if not force:
+        lock_duration = bidder.worklock_agent.worklock_parameters()[-2]
+        emitter.echo(WORKLOCK_CLAIM_ADVISORY.format(lock_duration=lock_duration), color='blue')
+        click.confirm(CONFIRM_WORKLOCK_CLAIM.format(bidder_address=bidder_address), abort=True)
+    emitter.echo(SUBMITTING_WORKLOCK_CLAIM)
+
     receipt = bidder.claim()
     paint_receipt_summary(receipt=receipt, emitter=emitter, chain_name=bidder.staking_agent.blockchain.client.chain_name)
     paint_worklock_claim(emitter=emitter,
-                         bidder_address=worklock_options.bidder_address,
-                         network=registry_options.network,
-                         provider_uri=registry_options.provider_uri)
-    return  # Exit
+                         bidder_address=bidder_address,
+                         network=worklock_options.network,
+                         provider_uri=worklock_options.provider_uri)
 
 
 @worklock.command()
 @group_worklock_options
-@group_registry_options
 @group_general_config
-def remaining_work(general_config, worklock_options, registry_options):
-    emitter = _setup_emitter(general_config)
-    if not worklock_options.bidder_address:
-        worklock_options.bidder_address = select_client_account(emitter=emitter,
-                                                                provider_uri=registry_options.provider_uri,
-                                                                network=registry_options.network,
-                                                                show_balances=True)
-    registry = registry_options.get_registry(emitter, general_config.debug)
+def remaining_work(general_config: GroupGeneralConfig, worklock_options: WorkLockOptions):
+    """Check how much work is pending until you can get all your locked ETH back"""
+    emitter, registry, blockchain = worklock_options.setup(general_config=general_config)
+    bidder_address = worklock_options.get_bidder_address(emitter, registry)
     bidder = worklock_options.create_transactionless_bidder(registry=registry)
-    _remaining_work = bidder.remaining_work
-    emitter.echo(f"Work Remaining for {worklock_options.bidder_address}: {_remaining_work}")
-    return  # Exit
+    emitter.echo(f"Work Remaining for {bidder_address}: {bidder.remaining_work}")
 
 
 @worklock.command()
 @option_force
 @option_hw_wallet
-@group_registry_options
 @group_worklock_options
 @group_general_config
-def refund(general_config, worklock_options, registry_options, force, hw_wallet):
-    emitter = _setup_emitter(general_config)
-    if not worklock_options.bidder_address:
-        worklock_options.bidder_address = select_client_account(emitter=emitter,
-                                                                provider_uri=registry_options.provider_uri,
-                                                                network=registry_options.network,
-                                                                show_balances=True)
-    if not force:
-        click.confirm(f"Collect ETH refund for bidder {worklock_options.bidder_address}?", abort=True)
-    emitter.message("Submitting WorkLock refund request...")
-    registry = registry_options.get_registry(emitter, general_config.debug)
+def refund(general_config: GroupGeneralConfig, worklock_options: WorkLockOptions, force: bool, hw_wallet: bool):
+    """Reclaim ETH unlocked by your work"""
+    emitter, registry, blockchain = worklock_options.setup(general_config=general_config)
+    bidder_address = worklock_options.get_bidder_address(emitter, registry)
+
     bidder = worklock_options.create_bidder(registry=registry, hw_wallet=hw_wallet)
+
+    if not force:
+        click.confirm(CONFIRM_COLLECT_WORKLOCK_REFUND.format(bidder_address=bidder_address), abort=True)
+    emitter.echo(SUBMITTING_WORKLOCK_REFUND_REQUEST)
+
     receipt = bidder.refund_deposit()
     paint_receipt_summary(receipt=receipt, emitter=emitter, chain_name=bidder.staking_agent.blockchain.client.chain_name)
-    return  # Exit
 
 
 @worklock.command()
-@group_registry_options
 @group_general_config
-@option_checksum_address
-def burn_unclaimed_tokens(general_config, registry_options, checksum_address):
-    emitter = _setup_emitter(general_config)
-    registry = registry_options.get_registry(emitter, general_config.debug)
-    worklock_agent = ContractAgency.get_agent(WorkLockAgent, registry=registry)
-    if not checksum_address:
-        checksum_address = select_client_account(emitter=emitter,
-                                                 provider_uri=registry_options.provider_uri,
-                                                 network=registry_options.network,
-                                                 show_balances=True)
-    # FIXME: This won't work in real life, it needs TransactingPowers and stuff
-    receipt = worklock_agent.burn_unclaimed(sender_address=checksum_address)
-    paint_receipt_summary(receipt=receipt, emitter=emitter, chain_name=worklock_agent.blockchain.client.chain_name)
-    return  # Exit
+@group_worklock_options
+@option_force
+@option_hw_wallet
+@click.option('--gas-limit', help="Gas limit per each verification transaction", type=click.IntRange(min=60000))
+# TODO: Consider moving to administrator (nucypher-deploy) #1758
+def enable_claiming(general_config: GroupGeneralConfig,
+                    worklock_options: WorkLockOptions,
+                    force: bool,
+                    hw_wallet: bool,
+                    gas_limit: int):
+    """Ensure correctness of bidding and enable claiming"""
+    emitter, registry, blockchain = worklock_options.setup(general_config=general_config)
+    bidder_address = worklock_options.get_bidder_address(emitter, registry)
+    bidder = worklock_options.create_bidder(registry=registry, hw_wallet=hw_wallet)
+
+    whales = bidder.get_whales()
+    if whales:
+        headers = ("Bidders that require correction", "Current bid bonus")
+        columns = (whales.keys(), map(prettify_eth_amount, whales.values()))
+        emitter.echo(tabulate.tabulate(dict(zip(headers, columns)), headers=headers, floatfmt="fancy_grid"))
+
+        if not force:
+            click.confirm(f"Confirm force refund to at least {len(whales)} bidders using {bidder_address}?", abort=True)
+
+        force_refund_receipt = bidder.force_refund()
+        emitter.echo(WHALE_WARNING.format(number=len(whales)), color='green')
+
+        paint_receipt_summary(receipt=force_refund_receipt,
+                              emitter=emitter,
+                              chain_name=bidder.staking_agent.blockchain.client.chain_name,
+                              transaction_type=f"force-refund")
+    else:
+        emitter.echo(BIDS_VALID_NO_FORCE_REFUND_INDICATED, color='yellow')
+
+    if not bidder.worklock_agent.bidders_checked():
+
+        confirmation = gas_limit and force
+        while not confirmation:
+            if not gas_limit:
+                min_gas = 180000
+                gas_limit = click.prompt(PROMPT_BID_VERIFY_GAS_LIMIT.format(min_gas=min_gas), type=click.IntRange(min=min_gas))
+
+            bidders_per_transaction = bidder.worklock_agent.estimate_verifying_correctness(gas_limit=gas_limit)
+
+            if not force:
+                message = CONFIRM_BID_VERIFICATION.format(bidder_address=bidder_address,
+                                                          gas_limit=gas_limit,
+                                                          bidders_per_transaction=bidders_per_transaction)
+                confirmation = click.confirm(message)
+                gas_limit = gas_limit if confirmation else None
+            else:
+                emitter.echo(VERIFICATION_ESTIMATES.format(gas_limit=gas_limit,
+                                                           bidders_per_transaction=bidders_per_transaction))
+                confirmation = True
+
+        verification_receipts = bidder.verify_bidding_correctness(gas_limit=gas_limit)
+        emitter.echo(COMPLETED_BID_VERIFICATION, color='green')
+
+        for iteration, receipt in verification_receipts.items():
+            paint_receipt_summary(receipt=receipt,
+                                  emitter=emitter,
+                                  chain_name=bidder.staking_agent.blockchain.client.chain_name,
+                                  transaction_type=f"verify-correctness[{iteration}]")
+    else:
+        emitter.echo(BIDDERS_ALREADY_VERIFIED, color='yellow')

@@ -1,35 +1,49 @@
+"""
+ This file is part of nucypher.
+
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
 import json
-import os
-from datetime import datetime, timedelta
-from decimal import Decimal
 
 import eth_utils
 import math
 import maya
+import os
 import time
 from constant_sorrow.constants import NOT_RUNNING, NO_DATABASE_AVAILABLE
+from datetime import datetime, timedelta
+from decimal import Decimal
 from flask import Flask, Response
 from hendrix.deploy.base import HendrixDeploy
 from nacl.hash import sha256
 from sqlalchemy import create_engine, or_
-from twisted.internet import threads, reactor
+from twisted.internet import reactor, threads
 from twisted.internet.task import LoopingCall
 from twisted.logger import Logger
 
 from nucypher.blockchain.economics import EconomicsFactory
 from nucypher.blockchain.eth.actors import NucypherTokenActor
-from nucypher.blockchain.eth.agents import (
-    NucypherTokenAgent,
-    ContractAgency
-)
-from nucypher.blockchain.eth.interfaces import BlockchainInterface
+from nucypher.blockchain.eth.agents import (ContractAgency, NucypherTokenAgent)
+from nucypher.blockchain.eth.constants import NULL_ADDRESS
 from nucypher.blockchain.eth.registry import BaseContractRegistry
 from nucypher.blockchain.eth.token import NU
 from nucypher.characters.banners import FELIX_BANNER, NU_BANNER
 from nucypher.characters.base import Character
-from nucypher.config.constants import TEMPLATES_DIR
+from nucypher.config.constants import MAX_UPLOAD_CONTENT_LENGTH, TEMPLATES_DIR
 from nucypher.crypto.powers import SigningPower, TransactingPower
-from nucypher.keystore.threading import ThreadedSession
+from nucypher.datastore.threading import ThreadedSession
 
 
 class Felix(Character, NucypherTokenActor):
@@ -103,7 +117,7 @@ class Felix(Character, NucypherTokenActor):
 
         self.token_agent = ContractAgency.get_agent(NucypherTokenAgent, registry=registry)
         self.blockchain = self.token_agent.blockchain
-        self.reserved_addresses = [self.checksum_address, BlockchainInterface.NULL_ADDRESS]
+        self.reserved_addresses = [self.checksum_address, NULL_ADDRESS]
 
         # Update reserved addresses with deployed contracts
         existing_entries = list(registry.enrolled_addresses)
@@ -139,6 +153,8 @@ class Felix(Character, NucypherTokenActor):
         short_name = bytes(self.stamp).hex()[:6]
         self.rest_app = Flask(f"faucet-{short_name}", template_folder=TEMPLATES_DIR)
         self.rest_app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{self.db_filepath}'
+        self.rest_app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_CONTENT_LENGTH
+
         try:
             self.rest_app.secret_key = sha256(os.environ['NUCYPHER_FELIX_DB_SECRET'].encode())  # uses envvar
         except KeyError:
@@ -333,7 +349,7 @@ class Felix(Character, NucypherTokenActor):
             self.log.info(
                 f"Disbursement #{self.__disbursement} OK | {txhash.hex()[-6:]} |"
                 f"({str(NU(disbursement, 'NuNit'))} -> {recipient_address}")
-                
+
         return txhash
 
     def airdrop_tokens(self):

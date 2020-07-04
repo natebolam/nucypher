@@ -17,22 +17,24 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 
 import pytest
 
-from nucypher.blockchain.eth.networks import NetworksInventory
 from nucypher.characters.control.emitters import WebEmitter
-from nucypher.cli.config import GroupGeneralConfig
 from nucypher.crypto.powers import TransactingPower
+from nucypher.network.trackers import AvailabilityTracker
 from nucypher.utilities.logging import GlobalLoggerSettings
-from nucypher.utilities.sandbox.constants import INSECURE_DEVELOPMENT_PASSWORD, TEMPORARY_DOMAIN
+from tests.constants import INSECURE_DEVELOPMENT_PASSWORD
 
 # Crash on server error by default
 WebEmitter._crash_on_error_default = True
 
-# Dont re-lock account in background during activity confirmations
+# Dont re-lock account in background while making commitments
 LOCK_FUNCTION = TransactingPower.lock_account
 TransactingPower.lock_account = lambda *a, **k: True
 
 # Disable any hardcoded preferred teachers during tests.
 TEACHER_NODES = dict()
+
+# Prevent halting the reactor via health checks during tests
+AvailabilityTracker._halt_reactor = lambda *a, **kw: True
 
 ##########################################
 
@@ -65,6 +67,14 @@ def __very_pretty_and_insecure_scrypt_do_not_use():
     Scrypt.derive = original_derivation_function
 
 ############################################
+
+
+@pytest.fixture(scope='module')
+def monkeymodule():
+    from _pytest.monkeypatch import MonkeyPatch
+    mpatch = MonkeyPatch()
+    yield mpatch
+    mpatch.undo()
 
 
 #
@@ -124,4 +134,3 @@ def pytest_collection_modifyitems(config, items):
     GlobalLoggerSettings.set_log_level(log_level_name)
     GlobalLoggerSettings.start_text_file_logging()
     GlobalLoggerSettings.start_json_file_logging()
-

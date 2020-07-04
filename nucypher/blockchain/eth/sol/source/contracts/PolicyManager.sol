@@ -1,4 +1,6 @@
-pragma solidity ^0.5.3;
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.5;
 
 
 import "zeppelin/token/ERC20/SafeERC20.sol";
@@ -13,8 +15,8 @@ import "contracts/proxy/Upgradeable.sol";
 
 
 /**
-* @notice Contract holds policy data and locks fees
-* @dev |v2.2.1|
+* @notice Contract holds policy data and locks accrued policy fees
+* @dev |v6.1.1|
 */
 contract PolicyManager is Upgradeable {
     using SafeERC20 for NuCypherToken;
@@ -28,25 +30,15 @@ contract PolicyManager is Upgradeable {
         bytes16 indexed policyId,
         address indexed sponsor,
         address indexed owner,
-        uint256 rewardRate,
+        uint256 feeRate,
         uint64 startTimestamp,
         uint64 endTimestamp,
         uint256 numberOfNodes
-    );
-    event PolicyRevoked(
-        bytes16 indexed policyId,
-        address indexed sender,
-        uint256 value
     );
     event ArrangementRevoked(
         bytes16 indexed policyId,
         address indexed sender,
         address indexed node,
-        uint256 value
-    );
-    event Withdrawn(
-        address indexed node,
-        address indexed recipient,
         uint256 value
     );
     event RefundForArrangement(
@@ -55,27 +47,14 @@ contract PolicyManager is Upgradeable {
         address indexed node,
         uint256 value
     );
-    event RefundForPolicy(
-        bytes16 indexed policyId,
-        address indexed sender,
-        uint256 value
-    );
-    event NodeBrokenState(
-        address indexed node,
-        uint16 period
-    );
-    event MinRewardRateSet(
-        address indexed node,
-        uint256 value
-    );
-    event MinRewardRateRangeSet(
-        address indexed sender,
-        // TODO #1501
-        // Range range
-        uint256 min,
-        uint256 defaultValue,
-        uint256 max
-    );
+    event PolicyRevoked(bytes16 indexed policyId, address indexed sender, uint256 value);
+    event RefundForPolicy(bytes16 indexed policyId, address indexed sender, uint256 value);
+    event NodeBrokenState(address indexed node, uint16 period);
+    event MinFeeRateSet(address indexed node, uint256 value);
+    // TODO #1501
+    // Range range
+    event FeeRateRangeSet(address indexed sender, uint256 min, uint256 defaultValue, uint256 max);
+    event Withdrawn(address indexed node, address indexed recipient, uint256 value);
 
     struct ArrangementInfo {
         address node;
@@ -84,13 +63,13 @@ contract PolicyManager is Upgradeable {
     }
 
     struct Policy {
+        bool disabled;
         address payable sponsor;
         address owner;
 
-        uint256 rewardRate;
+        uint128 feeRate;
         uint64 startTimestamp;
         uint64 endTimestamp;
-        bool disabled;
 
         uint256 reservedSlot1;
         uint256 reservedSlot2;
@@ -102,29 +81,31 @@ contract PolicyManager is Upgradeable {
     }
 
     struct NodeInfo {
-        uint256 reward;
-        uint256 rewardRate;
-        uint16 lastMinedPeriod;
-        mapping (uint16 => int256) rewardDelta;
-        uint256 minRewardRate;
+        uint128 fee;
+        uint16 previousFeePeriod;
+        uint256 feeRate;
+        uint256 minFeeRate;
+        mapping (uint16 => int256) feeDelta;
     }
 
     struct Range {
-        uint256 min;
-        uint256 defaultValue;
-        uint256 max;
+        uint128 min;
+        uint128 defaultValue;
+        uint128 max;
     }
 
-    bytes16 constant RESERVED_POLICY_ID = bytes16(0);
-    address constant RESERVED_NODE = address(0);
+    bytes16 internal constant RESERVED_POLICY_ID = bytes16(0);
+    address internal constant RESERVED_NODE = address(0);
+    uint256 internal constant MAX_BALANCE = uint256(uint128(0) - 1);
     // controlled overflow to get max int256
-    int256 public constant DEFAULT_REWARD_DELTA = int256((uint256(0) - 1) >> 1);
+    int256 public constant DEFAULT_FEE_DELTA = int256((uint256(0) - 1) >> 1);
 
-    StakingEscrow public escrow;
-    uint32 public secondsPerPeriod;
+    StakingEscrow public immutable escrow;
+    uint32 public immutable secondsPerPeriod;
+
     mapping (bytes16 => Policy) public policies;
     mapping (address => NodeInfo) public nodes;
-    Range public minRewardRateRange;
+    Range public feeRateRange;
 
     /**
     * @notice Constructor sets address of the escrow contract
@@ -132,8 +113,9 @@ contract PolicyManager is Upgradeable {
     */
     constructor(StakingEscrow _escrow) public {
         // if the input address is not the StakingEscrow then calling `secondsPerPeriod` will throw error
-        secondsPerPeriod = _escrow.secondsPerPeriod();
-        require(secondsPerPeriod > 0);
+        uint32 localSecondsPerPeriod = _escrow.secondsPerPeriod();
+        require(localSecondsPerPeriod > 0);
+        secondsPerPeriod = localSecondsPerPeriod;
         escrow = _escrow;
     }
 
@@ -160,57 +142,58 @@ contract PolicyManager is Upgradeable {
     */
     function register(address _node, uint16 _period) external onlyEscrowContract {
         NodeInfo storage nodeInfo = nodes[_node];
-        require(nodeInfo.lastMinedPeriod == 0 && _period < getCurrentPeriod());
-        nodeInfo.lastMinedPeriod = _period;
+        require(nodeInfo.previousFeePeriod == 0 && _period < getCurrentPeriod());
+        nodeInfo.previousFeePeriod = _period;
     }
 
     /**
-    * @notice Set range for the minimum reward rate for all nodes
+    * @notice Set minimum, default & maximum fee rate for all stakers and all policies ('global fee range')
     */
     // TODO # 1501
-    // function setMinRewardRateRange(Range calldata _range) external onlyOwner {
-    function setMinRewardRateRange(uint256 _min, uint256 _default, uint256 _max) external onlyOwner {
+    // function setFeeRateRange(Range calldata _range) external onlyOwner {
+    function setFeeRateRange(uint128 _min, uint128 _default, uint128 _max) external onlyOwner {
         require(_min <= _default && _default <= _max);
-        minRewardRateRange = Range(_min, _default, _max);
-        emit MinRewardRateRangeSet(msg.sender, _min, _default, _max);
+        feeRateRange = Range(_min, _default, _max);
+        emit FeeRateRangeSet(msg.sender, _min, _default, _max);
     }
 
     /**
-    * @notice Set the minimum reward acceptable by node
-    * @dev Input value must be within `minRewardRateRange`
+    * @notice Set the minimum acceptable fee rate (set by staker for their associated worker)
+    * @dev Input value must fall within `feeRateRange` (global fee range)
     */
-    function setMinRewardRate(uint256 _minRewardRate) external {
-        require(_minRewardRate >= minRewardRateRange.min &&
-            _minRewardRate <= minRewardRateRange.max,
-            "The min reward rate must be within permitted range");
+    function setMinFeeRate(uint256 _minFeeRate) external {
+        require(_minFeeRate >= feeRateRange.min &&
+            _minFeeRate <= feeRateRange.max,
+            "The staker's min fee rate must fall within the global fee range");
         NodeInfo storage nodeInfo = nodes[msg.sender];
-        if (nodeInfo.minRewardRate == _minRewardRate) {
+        if (nodeInfo.minFeeRate == _minFeeRate) {
             return;
         }
-        nodeInfo.minRewardRate = _minRewardRate;
-        emit MinRewardRateSet(msg.sender, _minRewardRate);
+        nodeInfo.minFeeRate = _minFeeRate;
+        emit MinFeeRateSet(msg.sender, _minFeeRate);
     }
 
     /**
-    * @notice Get the minimum reward rate acceptable by node
+    * @notice Get the minimum acceptable fee rate (set by staker for their associated worker)
     */
-    function getMinRewardRate(NodeInfo storage _nodeInfo) internal returns (uint256) {
-        // if minRewardRate has not been set or is outside the acceptable range
-        if (_nodeInfo.minRewardRate == 0 ||
-            _nodeInfo.minRewardRate < minRewardRateRange.min ||
-            _nodeInfo.minRewardRate > minRewardRateRange.max) {
-            return minRewardRateRange.defaultValue;
+    function getMinFeeRate(NodeInfo storage _nodeInfo) internal view returns (uint256) {
+        // if minFeeRate has not been set or chosen value falls outside the global fee range
+        // a default value is returned instead
+        if (_nodeInfo.minFeeRate == 0 ||
+            _nodeInfo.minFeeRate < feeRateRange.min ||
+            _nodeInfo.minFeeRate > feeRateRange.max) {
+            return feeRateRange.defaultValue;
         } else {
-            return _nodeInfo.minRewardRate;
+            return _nodeInfo.minFeeRate;
         }
     }
 
     /**
-    * @notice Get the minimum reward rate acceptable by node
+    * @notice Get the minimum acceptable fee rate (set by staker for their associated worker)
     */
-    function getMinRewardRate(address _node) public returns (uint256) {
+    function getMinFeeRate(address _node) public view returns (uint256) {
         NodeInfo storage nodeInfo = nodes[_node];
-        return getMinRewardRate(nodeInfo);
+        return getMinFeeRate(nodeInfo);
     }
 
     /**
@@ -232,10 +215,12 @@ contract PolicyManager is Upgradeable {
         Policy storage policy = policies[_policyId];
         require(
             _policyId != RESERVED_POLICY_ID &&
-            policy.rewardRate == 0 &&
+            policy.feeRate == 0 &&
+            !policy.disabled &&
             _endTimestamp > block.timestamp &&
             msg.value > 0
         );
+        require(address(this).balance <= MAX_BALANCE);
         uint16 currentPeriod = getCurrentPeriod();
         uint16 endPeriod = uint16(_endTimestamp / secondsPerPeriod) + 1;
         uint256 numberOfPeriods = endPeriod - currentPeriod;
@@ -243,8 +228,8 @@ contract PolicyManager is Upgradeable {
         policy.sponsor = msg.sender;
         policy.startTimestamp = uint64(block.timestamp);
         policy.endTimestamp = _endTimestamp;
-        policy.rewardRate = msg.value.div(_nodes.length) / numberOfPeriods;
-        require(policy.rewardRate > 0 && policy.rewardRate * numberOfPeriods * _nodes.length  == msg.value);
+        policy.feeRate = uint128(msg.value.div(_nodes.length) / numberOfPeriods);
+        require(policy.feeRate > 0 && policy.feeRate * numberOfPeriods * _nodes.length  == msg.value);
         if (_policyOwner != msg.sender && _policyOwner != address(0)) {
             policy.owner = _policyOwner;
         }
@@ -253,27 +238,27 @@ contract PolicyManager is Upgradeable {
             address node = _nodes[i];
             require(node != RESERVED_NODE);
             NodeInfo storage nodeInfo = nodes[node];
-            require(nodeInfo.lastMinedPeriod != 0 &&
-                nodeInfo.lastMinedPeriod < currentPeriod &&
-                policy.rewardRate >= getMinRewardRate(nodeInfo));
-            // Check default value for rewardDelta
-            if (nodeInfo.rewardDelta[currentPeriod] == DEFAULT_REWARD_DELTA) {
-                nodeInfo.rewardDelta[currentPeriod] = int256(policy.rewardRate);
+            require(nodeInfo.previousFeePeriod != 0 &&
+                nodeInfo.previousFeePeriod < currentPeriod &&
+                policy.feeRate >= getMinFeeRate(nodeInfo));
+            // Check default value for feeDelta
+            if (nodeInfo.feeDelta[currentPeriod] == DEFAULT_FEE_DELTA) {
+                nodeInfo.feeDelta[currentPeriod] = int256(policy.feeRate);
             } else {
                 // Overflow protection removed, because ETH total supply less than uint255/int256
-                nodeInfo.rewardDelta[currentPeriod] += int256(policy.rewardRate);
+                nodeInfo.feeDelta[currentPeriod] += int256(policy.feeRate);
             }
-            if (nodeInfo.rewardDelta[endPeriod] == DEFAULT_REWARD_DELTA) {
-                nodeInfo.rewardDelta[endPeriod] = -int256(policy.rewardRate);
+            if (nodeInfo.feeDelta[endPeriod] == DEFAULT_FEE_DELTA) {
+                nodeInfo.feeDelta[endPeriod] = -int256(policy.feeRate);
             } else {
-                nodeInfo.rewardDelta[endPeriod] -= int256(policy.rewardRate);
+                nodeInfo.feeDelta[endPeriod] -= int256(policy.feeRate);
             }
             // Reset to default value if needed
-            if (nodeInfo.rewardDelta[currentPeriod] == 0) {
-                nodeInfo.rewardDelta[currentPeriod] = DEFAULT_REWARD_DELTA;
+            if (nodeInfo.feeDelta[currentPeriod] == 0) {
+                nodeInfo.feeDelta[currentPeriod] = DEFAULT_FEE_DELTA;
             }
-            if (nodeInfo.rewardDelta[endPeriod] == 0) {
-                nodeInfo.rewardDelta[endPeriod] = DEFAULT_REWARD_DELTA;
+            if (nodeInfo.feeDelta[endPeriod] == 0) {
+                nodeInfo.feeDelta[endPeriod] = DEFAULT_FEE_DELTA;
             }
             policy.arrangements.push(ArrangementInfo(node, 0, 0));
         }
@@ -282,7 +267,7 @@ contract PolicyManager is Upgradeable {
             _policyId,
             msg.sender,
             _policyOwner == address(0) ? msg.sender : _policyOwner,
-            policy.rewardRate,
+            policy.feeRate,
             policy.startTimestamp,
             policy.endTimestamp,
             _nodes.length
@@ -298,71 +283,71 @@ contract PolicyManager is Upgradeable {
     }
 
     /**
-    * @notice Set default `rewardDelta` value for specified period
+    * @notice Set default `feeDelta` value for specified period
     * @dev This method increases gas cost for node in trade of decreasing cost for policy sponsor
     * @param _node Node address
     * @param _period Period to set
     */
-    function setDefaultRewardDelta(address _node, uint16 _period) external onlyEscrowContract {
+    function setDefaultFeeDelta(address _node, uint16 _period) external onlyEscrowContract {
         NodeInfo storage node = nodes[_node];
-        if (node.rewardDelta[_period] == 0) {
-            node.rewardDelta[_period] = DEFAULT_REWARD_DELTA;
+        if (node.feeDelta[_period] == 0) {
+            node.feeDelta[_period] = DEFAULT_FEE_DELTA;
         }
     }
 
     /**
-    * @notice Update node reward
+    * @notice Update node fee
     * @param _node Node address
     * @param _period Processed period
     */
-    function updateReward(address _node, uint16 _period) external onlyEscrowContract {
+    function updateFee(address _node, uint16 _period) external onlyEscrowContract {
         NodeInfo storage node = nodes[_node];
-        if (node.lastMinedPeriod == 0 || _period <= node.lastMinedPeriod) {
+        if (node.previousFeePeriod == 0 || _period <= node.previousFeePeriod) {
             return;
         }
-        for (uint16 i = node.lastMinedPeriod + 1; i <= _period; i++) {
-            int256 delta = node.rewardDelta[i];
-            if (delta == DEFAULT_REWARD_DELTA) {
+        for (uint16 i = node.previousFeePeriod + 1; i <= _period; i++) {
+            int256 delta = node.feeDelta[i];
+            if (delta == DEFAULT_FEE_DELTA) {
                 // gas refund
-                node.rewardDelta[i] = 0;
+                node.feeDelta[i] = 0;
                 continue;
             }
 
             // broken state
-            if (delta < 0 && uint256(-delta) > node.rewardRate) {
-                node.rewardDelta[i] += int256(node.rewardRate);
-                node.rewardRate = 0;
+            if (delta < 0 && uint256(-delta) > node.feeRate) {
+                node.feeDelta[i] += int256(node.feeRate);
+                node.feeRate = 0;
                 emit NodeBrokenState(_node, _period);
             // good state
             } else {
-                node.rewardRate = node.rewardRate.addSigned(delta);
+                node.feeRate = node.feeRate.addSigned(delta);
                 // gas refund
-                node.rewardDelta[i] = 0;
+                node.feeDelta[i] = 0;
             }
         }
-        node.lastMinedPeriod = _period;
-        node.reward += node.rewardRate;
+        node.previousFeePeriod = _period;
+        node.fee += uint128(node.feeRate);
     }
 
     /**
-    * @notice Withdraw reward by node
+    * @notice Withdraw fee by node
     */
     function withdraw() external returns (uint256) {
         return withdraw(msg.sender);
     }
 
     /**
-    * @notice Withdraw reward by node
-    * @param _recipient Recipient of the reward
+    * @notice Withdraw fee by node
+    * @param _recipient Recipient of the fee
     */
     function withdraw(address payable _recipient) public returns (uint256) {
         NodeInfo storage node = nodes[msg.sender];
-        uint256 reward = node.reward;
-        require(reward != 0);
-        node.reward = 0;
-        _recipient.sendValue(reward);
-        emit Withdrawn(msg.sender, _recipient, reward);
-        return reward;
+        uint256 fee = node.fee;
+        require(fee != 0);
+        node.fee = 0;
+        _recipient.sendValue(fee);
+        emit Withdrawn(msg.sender, _recipient, fee);
+        return fee;
     }
 
     /**
@@ -403,14 +388,14 @@ contract PolicyManager is Upgradeable {
             }
         }
 
-        uint16 lastActivePeriod = escrow.getLastActivePeriod(_arrangement.node);
-        if (indexOfDowntimePeriods == length && lastActivePeriod < maxPeriod) {
+        uint16 lastCommittedPeriod = escrow.getLastCommittedPeriod(_arrangement.node);
+        if (indexOfDowntimePeriods == length && lastCommittedPeriod < maxPeriod) {
             // Overflow protection removed:
-            // lastActivePeriod < maxPeriod and minPeriod <= maxPeriod + 1
-            downtimePeriods += maxPeriod - AdditionalMath.max16(minPeriod - 1, lastActivePeriod);
+            // lastCommittedPeriod < maxPeriod and minPeriod <= maxPeriod + 1
+            downtimePeriods += maxPeriod - AdditionalMath.max16(minPeriod - 1, lastCommittedPeriod);
         }
 
-        refundValue = _policy.rewardRate * downtimePeriods;
+        refundValue = _policy.feeRate * downtimePeriods;
         lastRefundedPeriod = maxPeriod + 1;
     }
 
@@ -442,27 +427,27 @@ contract PolicyManager is Upgradeable {
             if (_forceRevoke) {
                 NodeInfo storage nodeInfo = nodes[node];
 
-                // Check default value for rewardDelta
+                // Check default value for feeDelta
                 uint16 lastRefundedPeriod = arrangement.lastRefundedPeriod;
-                if (nodeInfo.rewardDelta[lastRefundedPeriod] == DEFAULT_REWARD_DELTA) {
-                    nodeInfo.rewardDelta[lastRefundedPeriod] = -int256(policy.rewardRate);
+                if (nodeInfo.feeDelta[lastRefundedPeriod] == DEFAULT_FEE_DELTA) {
+                    nodeInfo.feeDelta[lastRefundedPeriod] = -int256(policy.feeRate);
                 } else {
-                    nodeInfo.rewardDelta[lastRefundedPeriod] -= int256(policy.rewardRate);
+                    nodeInfo.feeDelta[lastRefundedPeriod] -= int256(policy.feeRate);
                 }
-                if (nodeInfo.rewardDelta[endPeriod] == DEFAULT_REWARD_DELTA) {
-                    nodeInfo.rewardDelta[endPeriod] = -int256(policy.rewardRate);
+                if (nodeInfo.feeDelta[endPeriod] == DEFAULT_FEE_DELTA) {
+                    nodeInfo.feeDelta[endPeriod] = -int256(policy.feeRate);
                 } else {
-                    nodeInfo.rewardDelta[endPeriod] += int256(policy.rewardRate);
+                    nodeInfo.feeDelta[endPeriod] += int256(policy.feeRate);
                 }
 
                 // Reset to default value if needed
-                if (nodeInfo.rewardDelta[lastRefundedPeriod] == 0) {
-                    nodeInfo.rewardDelta[lastRefundedPeriod] = DEFAULT_REWARD_DELTA;
+                if (nodeInfo.feeDelta[lastRefundedPeriod] == 0) {
+                    nodeInfo.feeDelta[lastRefundedPeriod] = DEFAULT_FEE_DELTA;
                 }
-                if (nodeInfo.rewardDelta[endPeriod] == 0) {
-                    nodeInfo.rewardDelta[endPeriod] = DEFAULT_REWARD_DELTA;
+                if (nodeInfo.feeDelta[endPeriod] == 0) {
+                    nodeInfo.feeDelta[endPeriod] = DEFAULT_FEE_DELTA;
                 }
-                nodeRefundValue += uint256(endPeriod - lastRefundedPeriod) * policy.rewardRate;
+                nodeRefundValue += uint256(endPeriod - lastRefundedPeriod) * policy.feeRate;
             }
             if (_forceRevoke || arrangement.lastRefundedPeriod >= endPeriod) {
                 arrangement.node = RESERVED_NODE;
@@ -484,9 +469,11 @@ contract PolicyManager is Upgradeable {
             if (numberOfActive == 0) {
                 policy.disabled = true;
                 // gas refund
-                // deletion more slots will increase gas usage instead of decreasing (in current code)
-                // because gas refund can be no more than half of all gas
                 policy.sponsor = address(0);
+                policy.owner = address(0);
+                policy.feeRate = 0;
+                policy.startTimestamp = 0;
+                policy.endTimestamp = 0;
                 emit PolicyRevoked(_policyId, msg.sender, refundValue);
             } else {
                 emit RefundForPolicy(_policyId, msg.sender, refundValue);
@@ -636,21 +623,20 @@ contract PolicyManager is Upgradeable {
     * @notice Get number of arrangements in the policy
     * @param _policyId Policy id
     */
-    function getArrangementsLength(bytes16 _policyId)
-        external view returns (uint256)
-    {
+    function getArrangementsLength(bytes16 _policyId) external view returns (uint256) {
         return policies[_policyId].arrangements.length;
     }
 
     /**
-    * @notice Get information about node reward
-    * @param _node Address of node
-    * @param _period Period to get reward delta
+    * @notice Get information about staker's fee rate
+    * @param _node Address of staker
+    * @param _period Period to get fee delta
     */
-    function getNodeRewardDelta(address _node, uint16 _period)
-        external view returns (int256)
+    function getNodeFeeDelta(address _node, uint16 _period)
+        // TODO "virtual" only for tests, probably will be removed after #1512
+        external view virtual returns (int256)
     {
-        return nodes[_node].rewardDelta[_period];
+        return nodes[_node].feeDelta[_period];
     }
 
     /**
@@ -674,7 +660,7 @@ contract PolicyManager is Upgradeable {
     function delegateGetPolicy(address _target, bytes16 _policyId)
         internal returns (Policy memory result)
     {
-        bytes32 memoryAddress = delegateGetData(_target, "policies(bytes16)", 1, bytes32(_policyId), 0);
+        bytes32 memoryAddress = delegateGetData(_target, this.policies.selector, 1, bytes32(_policyId), 0);
         assembly {
             result := memoryAddress
         }
@@ -687,7 +673,7 @@ contract PolicyManager is Upgradeable {
         internal returns (ArrangementInfo memory result)
     {
         bytes32 memoryAddress = delegateGetData(
-            _target, "getArrangementInfo(bytes16,uint256)", 2, bytes32(_policyId), bytes32(_index));
+            _target, this.getArrangementInfo.selector, 2, bytes32(_policyId), bytes32(_index));
         assembly {
             result := memoryAddress
         }
@@ -699,41 +685,39 @@ contract PolicyManager is Upgradeable {
     function delegateGetNodeInfo(address _target, address _node)
         internal returns (NodeInfo memory result)
     {
-        bytes32 memoryAddress = delegateGetData(_target, "nodes(address)", 1, bytes32(uint256(_node)), 0);
+        bytes32 memoryAddress = delegateGetData(_target, this.nodes.selector, 1, bytes32(uint256(_node)), 0);
         assembly {
             result := memoryAddress
         }
     }
 
     /**
-    * @dev Get minRewardRateRange structure by delegatecall
+    * @dev Get feeRateRange structure by delegatecall
     */
-    function delegateGetMinRewardRateRange(address _target) internal returns (Range memory result) {
-        bytes32 memoryAddress = delegateGetData(_target, "minRewardRateRange()", 0, 0, 0);
+    function delegateGetFeeRateRange(address _target) internal returns (Range memory result) {
+        bytes32 memoryAddress = delegateGetData(_target, this.feeRateRange.selector, 0, 0, 0);
         assembly {
             result := memoryAddress
         }
     }
 
     /// @dev the `onlyWhileUpgrading` modifier works through a call to the parent `verifyState`
-    function verifyState(address _testTarget) public {
+    function verifyState(address _testTarget) public override virtual {
         super.verifyState(_testTarget);
-        require(address(delegateGet(_testTarget, "escrow()")) == address(escrow));
-        require(uint32(delegateGet(_testTarget, "secondsPerPeriod()")) == secondsPerPeriod);
-        Range memory rangeToCheck = delegateGetMinRewardRateRange(_testTarget);
-        require(minRewardRateRange.min == rangeToCheck.min &&
-            minRewardRateRange.defaultValue == rangeToCheck.defaultValue &&
-            minRewardRateRange.max == rangeToCheck.max);
+        Range memory rangeToCheck = delegateGetFeeRateRange(_testTarget);
+        require(feeRateRange.min == rangeToCheck.min &&
+            feeRateRange.defaultValue == rangeToCheck.defaultValue &&
+            feeRateRange.max == rangeToCheck.max);
         Policy storage policy = policies[RESERVED_POLICY_ID];
         Policy memory policyToCheck = delegateGetPolicy(_testTarget, RESERVED_POLICY_ID);
         require(policyToCheck.sponsor == policy.sponsor &&
             policyToCheck.owner == policy.owner &&
-            policyToCheck.rewardRate == policy.rewardRate &&
+            policyToCheck.feeRate == policy.feeRate &&
             policyToCheck.startTimestamp == policy.startTimestamp &&
             policyToCheck.endTimestamp == policy.endTimestamp &&
             policyToCheck.disabled == policy.disabled);
 
-        require(delegateGet(_testTarget, "getArrangementsLength(bytes16)", RESERVED_POLICY_ID) ==
+        require(delegateGet(_testTarget, this.getArrangementsLength.selector, RESERVED_POLICY_ID) ==
             policy.arrangements.length);
         if (policy.arrangements.length > 0) {
             ArrangementInfo storage arrangement = policy.arrangements[0];
@@ -746,35 +730,32 @@ contract PolicyManager is Upgradeable {
 
         NodeInfo storage nodeInfo = nodes[RESERVED_NODE];
         NodeInfo memory nodeInfoToCheck = delegateGetNodeInfo(_testTarget, RESERVED_NODE);
-        require(nodeInfoToCheck.reward == nodeInfo.reward &&
-            nodeInfoToCheck.rewardRate == nodeInfo.rewardRate &&
-            nodeInfoToCheck.lastMinedPeriod == nodeInfo.lastMinedPeriod &&
-            nodeInfoToCheck.minRewardRate == nodeInfo.minRewardRate);
+        require(nodeInfoToCheck.fee == nodeInfo.fee &&
+            nodeInfoToCheck.feeRate == nodeInfo.feeRate &&
+            nodeInfoToCheck.previousFeePeriod == nodeInfo.previousFeePeriod &&
+            nodeInfoToCheck.minFeeRate == nodeInfo.minFeeRate);
 
-        require(int256(delegateGet(_testTarget, "getNodeRewardDelta(address,uint16)",
-            bytes32(bytes20(RESERVED_NODE)), bytes32(uint256(11)))) == nodeInfo.rewardDelta[11]);
+        require(int256(delegateGet(_testTarget, this.getNodeFeeDelta.selector,
+            bytes32(bytes20(RESERVED_NODE)), bytes32(uint256(11)))) == nodeInfo.feeDelta[11]);
     }
 
     /// @dev the `onlyWhileUpgrading` modifier works through a call to the parent `finishUpgrade`
-    function finishUpgrade(address _target) public {
+    function finishUpgrade(address _target) public override virtual {
         super.finishUpgrade(_target);
-        PolicyManager policyManager = PolicyManager(_target);
-        escrow = policyManager.escrow();
-        secondsPerPeriod = policyManager.secondsPerPeriod();
         // Create fake Policy and NodeInfo to use them in verifyState(address)
         Policy storage policy = policies[RESERVED_POLICY_ID];
         policy.sponsor = msg.sender;
         policy.owner = address(this);
         policy.startTimestamp = 1;
         policy.endTimestamp = 2;
-        policy.rewardRate = 3;
+        policy.feeRate = 3;
         policy.disabled = true;
         policy.arrangements.push(ArrangementInfo(RESERVED_NODE, 11, 22));
         NodeInfo storage nodeInfo = nodes[RESERVED_NODE];
-        nodeInfo.reward = 100;
-        nodeInfo.rewardRate = 33;
-        nodeInfo.lastMinedPeriod = 44;
-        nodeInfo.rewardDelta[11] = 55;
-        nodeInfo.minRewardRate = 777;
+        nodeInfo.fee = 100;
+        nodeInfo.feeRate = 33;
+        nodeInfo.previousFeePeriod = 44;
+        nodeInfo.feeDelta[11] = 55;
+        nodeInfo.minFeeRate = 777;
     }
 }

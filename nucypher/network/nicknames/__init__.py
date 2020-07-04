@@ -14,6 +14,8 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
+
+
 import json
 import random
 from os.path import abspath, dirname, join
@@ -44,6 +46,9 @@ def nicename(symbol):
 
 
 def nickname_from_seed(seed, number_of_pairs=2):
+    # TODO: #1823 - Workaround for new nickname every restart
+    # if not seed:
+    #     raise ValueError("No checksum provided to derive nickname.")
     symbols = list(symbols_tuple)
 
     random.seed(seed)

@@ -1,4 +1,6 @@
-pragma solidity ^0.5.3;
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.1;
 
 
 import "zeppelin/token/ERC20/ERC20.sol";
@@ -40,7 +42,7 @@ contract NuCypherToken is ERC20, ERC20Detailed('NuCypher', 'NU', 18) {
 /**
 * @dev Interface to use the receiveApproval method
 */
-contract TokenRecipient {
+interface TokenRecipient {
 
     /**
     * @notice Receives a notification of approval of the transfer

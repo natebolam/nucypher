@@ -105,6 +105,12 @@ Whitepapers
     *by Michael Egorov, MacLane Wilkison - NuCypher*
 
 
+    https://github.com/nucypher/mining-paper/blob/master/2_phase_minting_schedule/twophase_subsidy_model.pdf
+
+    *"Temporally equitable subsidies: a two-phase token minting schedule"*
+    *by Arjun Hassard - NuCypher*
+
+
 **Cryptography**
 
     https://github.com/nucypher/umbral-doc/blob/master/umbral-doc.pdf
@@ -125,7 +131,9 @@ Whitepapers
    guides/installation_guide
    guides/network_node/network_node
    guides/development/development
+   guides/ethereum_node
    guides/worklock_guide
+   guides/environment_variables
    guides/contribution_guide
 
 .. toctree::
@@ -141,6 +149,7 @@ Whitepapers
    :caption: Architecture
 
    architecture/character
+   architecture/worklock
    architecture/contracts
    architecture/upgradeable_proxy_contracts
    architecture/sub_stakes
@@ -150,13 +159,13 @@ Whitepapers
    :maxdepth: 1
    :caption: API
 
-   api/characters
-   api/config
-   api/crypto
-   api/keyring
-   api/keystore
-   api/network
-   api/policy
+   api/nucypher.blockchain
+   api/nucypher.characters
+   api/nucypher.config
+   api/nucypher.policy
+   api/nucypher.network
+   api/nucypher.datastore
+   api/nucypher.crypto
 
 .. toctree::
    :maxdepth: 1
@@ -164,6 +173,7 @@ Whitepapers
 
    release_notes/genesis_release
    release_notes/pre_release_epics
+   release_notes/releases.rst
 
 .. toctree::
    :maxdepth: 1
@@ -175,6 +185,7 @@ Whitepapers
    :maxdepth: 1
    :caption: Support
 
+   support/node_providers
    support/community
    support/troubleshooting
    support/faq

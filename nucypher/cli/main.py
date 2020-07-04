@@ -13,61 +13,58 @@ GNU Affero General Public License for more details.
 
 You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
-
 """
-
 
 import click
 
-from nucypher.cli.commands import ursula, alice, bob, enrico, felix, stake, status, worklock
-from nucypher.cli.painting import echo_version
+from nucypher.cli.commands import alice, bob, enrico, felix, multisig, stake, status, ursula, worklock
+from nucypher.cli.painting.help import echo_version
 
 
 @click.group()
 @click.option('--version', help="Echo the CLI version", is_flag=True, callback=echo_version, expose_value=False, is_eager=True)
 def nucypher_cli():
-    pass
+    """Top level command for all things nucypher."""
 
 
 #
 # Character CLI Entry Points (Fan Out Input)
 #
-
-r"""
-            ursula
-              |
-              | 
-              |
-              |
-stdin --> cli.main --- alice
-              | \
-              |  \
-              |  bob
-              |
-            enrico
-
-
-
-New character CLI modules must be added here
-for the entry point to be attached to the nucypher base command.
-
-Inversely, commenting out an entry point here will disable it.
-"""
+#
+#             ursula
+#               |
+#               |
+#               |
+#               |
+# stdin --> cli.main --- alice
+#               | \
+#               |  \
+#               |  bob
+#               |
+#             enrico
+#
+#
+#
+# New character CLI modules must be added here
+# for the entry point to be attached to the nucypher base command.
+#
+# Inversely, commenting out an entry point here will disable it.
+#
 
 ENTRY_POINTS = (
 
-    # Utility Commands
-    status.status,  # Network Status
-    # device.device,  # TODO: nucypher device  # Hardware Wallet Management
-
     # Characters
-    alice.alice,  # Author of Policies
-    bob.bob,  # Builder of Capsules
-    enrico.enrico,  # Encryptor of Data
-    stake.stake,  # Stake Management
-    ursula.ursula,  # Untrusted Re-Encryption Proxy
-    felix.felix,    # Faucet
-    worklock.worklock  # WorkLock
+    alice.alice,        # Author of Policies
+    bob.bob,            # Builder of Capsules
+    enrico.enrico,      # Encryptor of Data
+    ursula.ursula,      # Untrusted Re-Encryption Proxy
+
+    # Utility Commands
+    stake.stake,        # Stake Management
+    status.status,      # Network Status
+    felix.felix,        # Faucet
+    multisig.multisig,  # MultiSig operations
+    worklock.worklock   # WorkLock
 )
 
 for entry_point in ENTRY_POINTS:

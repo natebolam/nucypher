@@ -16,22 +16,17 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 
+import requests
 import socket
 import ssl
-
-import requests
 import time
+from bytestring_splitter import BytestringSplitter, VariableLengthBytestring
 from constant_sorrow.constants import CERTIFICATE_NOT_SAVED, EXEMPT_FROM_VERIFICATION
-
-
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from twisted.logger import Logger
 from umbral.cfrags import CapsuleFrag
 from umbral.signing import Signature
-
-from bytestring_splitter import BytestringSplitter, VariableLengthBytestring
-
 
 EXEMPT_FROM_VERIFICATION.bool_value(False)
 
@@ -39,6 +34,9 @@ EXEMPT_FROM_VERIFICATION.bool_value(False)
 class NucypherMiddlewareClient:
     library = requests
     timeout = 1.2
+
+    def __init__(self, registry=None, *args, **kwargs):
+        self.registry = registry
 
     @staticmethod
     def response_cleaner(response):
@@ -53,9 +51,8 @@ class NucypherMiddlewareClient:
         """
         if node_or_sprout:
             if node_or_sprout is not EXEMPT_FROM_VERIFICATION:
-                node_or_sprout.mature()  # Morph into a node.
-                node = node_or_sprout  # Definitely a node.
-                node.verify_node(network_middleware_client=self)
+                node = node_or_sprout.mature()  # Morph into a node.
+                node.verify_node(network_middleware_client=self, registry=self.registry)
         return self.parse_node_or_host_and_port(node_or_sprout, host, port)
 
     def parse_node_or_host_and_port(self, node, host, port):
@@ -96,9 +93,8 @@ class NucypherMiddlewareClient:
 
     def __getattr__(self, method_name):
         # Quick sanity check.
-        if not method_name in ("post", "get", "put", "patch", "delete"):
-            raise TypeError(
-                f"This client is for HTTP only - you need to use a real HTTP verb, not '{method_name}'.")
+        if method_name not in ("post", "get", "put", "patch", "delete"):
+            raise TypeError(f"This client is for HTTP only - you need to use a real HTTP verb, not '{method_name}'.")
 
         def method_wrapper(path,
                            node_or_sprout=None,
@@ -123,7 +119,9 @@ class NucypherMiddlewareClient:
             response = self.invoke_method(method, url, verify=certificate_filepath, *args, **kwargs)
             cleaned_response = self.response_cleaner(response)
             if cleaned_response.status_code >= 300:
-                if cleaned_response.status_code == 404:
+                if cleaned_response.status_code == 400:
+                    raise RestMiddleware.BadRequest(reason=cleaned_response.json)
+                elif cleaned_response.status_code == 404:
                     m = f"While trying to {method_name} {args} ({kwargs}), server 404'd.  Response: {cleaned_response.content}"
                     raise RestMiddleware.NotFound(m)
                 else:
@@ -154,8 +152,13 @@ class RestMiddleware:
         def __init__(self, *args, **kwargs):
             super().__init__(status=404, *args, **kwargs)
 
+    class BadRequest(UnexpectedResponse):
+        def __init__(self, reason, *args, **kwargs):
+            self.reason = reason
+            super().__init__(message=reason, status=400, *args, **kwargs)
+
     def __init__(self, registry=None):
-        self.client = self._client_class()
+        self.client = self._client_class(registry)
 
     def get_certificate(self, host, port, timeout=3, retry_attempts: int = 3, retry_rate: int = 2,
                         current_attempt: int = 0):
@@ -170,10 +173,13 @@ class RestMiddleware:
             if current_attempt == retry_attempts:
                 message = f"No Response from seednode {host}:{port} after {retry_attempts} attempts"
                 self.log.info(message)
-                raise RuntimeError("No response from {}:{}".format(host, port))
-            self.log.info("No Response from seednode {}. Retrying in {} seconds...".format(host, retry_rate))
+                raise ConnectionRefusedError("No response from {}:{}".format(host, port))
+            self.log.info(f"No Response from seednode {host}:{port}. Retrying in {retry_rate} seconds...")
             time.sleep(retry_rate)
             return self.get_certificate(host, port, timeout, retry_attempts, retry_rate, current_attempt + 1)
+
+        except OSError:
+            raise  # TODO: #1835
 
         else:
             certificate = x509.load_pem_x509_certificate(seednode_certificate.encode(),
@@ -229,10 +235,21 @@ class RestMiddleware:
     def send_work_order_payload_to_ursula(self, work_order):
         payload = work_order.payload()
         id_as_hex = work_order.arrangement_id.hex()
-        return self.client.post(
+        response = self.client.post(
             node_or_sprout=work_order.ursula,
             path=f"kFrag/{id_as_hex}/reencrypt",
-            data=payload, timeout=2)
+            data=payload,
+            timeout=2
+        )
+        return response
+
+    def check_rest_availability(self, initiator, responder):
+        response = self.client.post(node_or_sprout=responder,
+                                    data=bytes(initiator),
+                                    path="ping",
+                                    timeout=6,  # Two round trips are expected
+                                    )
+        return response
 
     def get_nodes_via_rest(self,
                            node,

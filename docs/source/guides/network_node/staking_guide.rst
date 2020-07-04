@@ -19,17 +19,23 @@ they only need to perform stake management transactions. Using a hardware wallet
 for stakers since only temporarily access to private keys is required during stake management while providing a higher standard
 of security than software wallets.
 
-Staking Procedure:
+Mainnet Staking Procedure:
 
-1) Install ``nucypher`` on Staking machine (see :doc:`/guides/installation_guide`)
-2) Run an ethereum node on the Staker's machine eg. geth, parity, etc. (see `Run an Ethereum node for Staking`_)
-3) Create staker's ethereum address (see `Run an Ethereum node for Staking`_)
-4) Request testnet tokens by joining the `Discord server <https://discord.gg/7rmXa3S>`_ and type ``.getfunded <YOUR_STAKER_ETH_ADDRESS>`` in the #testnet-faucet channel
-5) Initiate a new StakeHolder and Stake (see `Initialize a new stakeholder`_)
-6) Create and fund worker's ethereum address with ETH
-7) Bond a Worker to a Staker using the worker's ethereum address (see `Bonding a Worker`_)
-8) Optionally, modify stake settings (see `Modifying Active Stakes`_)
-9) Configure and Run a Worker Node (see :ref:`ursula-config-guide`)
+#. Install ``nucypher`` on Staker's machine (see :doc:`/guides/installation_guide`)
+#. Obtain a Stake with tokens (initially via :ref:`WorkLock <worklock-guide>` at launch)
+#. Initialize a new StakeHolder (see `Initialize a new stakeholder`_)
+#. Bond a Worker to your Staker using the worker's ethereum address (see `Bonding a Worker`_)
+
+.. note::
+
+    For testnets the typical staking procedure is:
+
+        #. Install ``nucypher`` on Staker's machine (see :doc:`/guides/installation_guide`)
+        #. Establish ethereum account, provider, and, optionally, signer (see `Staking`_)
+        #. Request testnet tokens by joining the `Discord server <https://discord.gg/7rmXa3S>`_ and type ``.getfunded <YOUR_STAKER_ETH_ADDRESS>`` in the #testnet-faucet channel
+        #. Initialize a new StakeHolder and Stake (see `Initialize a new stakeholder`_)
+        #. Initialize a new stake (see `Initialize a new stake`_)
+        #. Bond a Worker to a Staker using the worker's ethereum address (see `Bonding a Worker`_)
 
 
 Staking CLI
@@ -55,11 +61,9 @@ All staking-related operations done by Staker are performed through the ``nucyph
 +----------------------+-------------------------------------------------------------------------------+
 |  ``accounts``        | Show ETH and NU balances for stakeholder's accounts                           |
 +----------------------+-------------------------------------------------------------------------------+
-|  ``sync``            | Synchronize stake data with on-chain information                              |
+|  ``bond-worker``     | Bond a worker to a staker                                                     |
 +----------------------+-------------------------------------------------------------------------------+
-|  ``set-worker``      | Bond a worker to a staker                                                     |
-+----------------------+-------------------------------------------------------------------------------+
-|  ``detach-worker``   | Detach worker currently bonded to a staker                                    |
+|  ``unbond-worker``   | Unbond worker currently bonded to a staker                                    |
 +----------------------+-------------------------------------------------------------------------------+
 |  ``collect-reward``  | Withdraw staking compensation from the contract to your wallet                |
 +----------------------+-------------------------------------------------------------------------------+
@@ -70,6 +74,8 @@ All staking-related operations done by Staker are performed through the ``nucyph
 |  ``prolong``         | Prolong an existing stake's duration                                          |
 +----------------------+-------------------------------------------------------------------------------+
 |  ``winddown``        | Manage winding down of stakes                                                 |
++----------------------+-------------------------------------------------------------------------------+
+|  ``mint``            | Mint last portion of reward                                                   |
 +----------------------+-------------------------------------------------------------------------------+
 
 **Stake Command Options**
@@ -102,104 +108,117 @@ All staking-related operations done by Staker are performed through the ``nucyph
 Staking
 --------
 
+Running an Ethereum Node for Staking
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Run an Ethereum node for Staking
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Staking transactions can be broadcasted using either a local or remote ethereum node. See
+:ref:`using-eth-node` for more information.
 
-Assuming you have ``geth`` installed, let's run a node on the Görli testnet.
+
+Using External Signing
+**********************
+
+By default, transaction signing requests are forwarded to the configured ethereum provider. This is the typical
+configuration for locally or independently run ethereum nodes. To use a remote ethereum provider
+(e.g. Alchemy, Infura, Public Remote Node) an external transaction signing client (e.g. `clef` or `geth`) is needed
+separate from the broadcasting node.
+
+Using Clef
+++++++++++
+See :ref:`signing-with-clef` for setting up Clef. By default, all requests to the clef signer require manual
+confirmation. This includes not only transactions but also more innocuous requests such as listing the accounts
+that the signer is handling. This means, for example, that a command like ``nucypher stake accounts`` will first ask
+for user confirmation in the clef CLI before showing the staker accounts. You can automate this confirmation by
+using :ref:`clef-rules`.
+
+
+Using Clef with nucypher commands
++++++++++++++++++++++++++++++++++
 
 .. code:: bash
 
-    $ geth --goerli
+    $ nucypher <COMMAND> <ACTION> --signer <CLEF IPC PATH> --hw-wallet
 
-If you want to use your hardware wallet, just connect it to your machine. You'll see something like this in logs:
-
-.. code:: bash
-
-    INFO [08-30|15:50:39.153] New wallet appeared      url=ledger://0001:000b:00      status="Ethereum app v1.2.7 online"
-
-If you see something like ``New wallet appeared, failed to open`` in the logs,
-you need to reconnect the hardware wallet (without turning the ``geth`` node
-off).
-
-If you don't have a hardware wallet, you can create a software one:
-
-Whilst running the initialized node:
+Some examples:
 
 .. code:: bash
 
-    Linux:
-    $ geth attach /home/<username>/.ethereum/goerli/geth.ipc
-    > personal.newAccount();
-    > eth.accounts
-    ["0x287a817426dd1ae78ea23e9918e2273b6733a43d"]
+    # Create a new stakeholder with clef as the default signer
+    $ nucypher stake init-stakeholder --signer clef:///home/<username>/.clef/clef.ipc ...
 
-    MacOS:
-    $ geth attach /Users/<username>/Library/Ethereum/goerli/geth.ipc
-    > personal.newAccount();
-    > eth.accounts
-    ["0x287a817426dd1ae78ea23e9918e2273b6733a43d"]
+    # Update an existing configuration with clef as the default signer
+    $ nucypher stake config --signer clef:///home/<username>/.clef/clef.ipc  # Set clef as the default signer
 
-Where ``0x287a817426dd1ae78ea23e9918e2273b6733a43d`` is your newly created
-account address and ``<username>`` is your user.
+    # Create a new stake using inline signer and provider values
+    $ nucypher stake create --signer clef:///home/<username>/.clef/clef.ipc --provider ~/.ethereum/geth.ipc
 
 
 Initialize a new stakeholder
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Before continuing with stake initiation and management, A setup step is required to configure nucypher for staking.
-This will create a configuration file (`~/.local/share/nucypher/stakeholder.josn`) containing editable configuration values.
+This will create a configuration file (`~/.local/share/nucypher/stakeholder.json`) containing editable configuration values.
 
 .. code:: bash
 
-    (nucypher)$ nucypher stake init-stakeholder --provider <PROVIDER> --network <NETWORK_NAME>
+    (nucypher)$ nucypher stake init-stakeholder --signer <SIGNER URI> --provider <PROVIDER> --network <NETWORK_NAME>
 
-If you ran ``geth`` node as above, your ``<PROVIDER>`` is
-``ipc:///home/<username>/.ethereum/goerli/geth.ipc``
-(on MacOS, ``ipc:///Users/<username>/Library/Ethereum/goerli/geth.ipc``)
+where:
 
-``<NETWORK_NAME>`` is the name of the NuCypher network domain where the staker will participate.
+    * If you utilized :ref:`signing-with-clef`, the ``SIGNER URI`` is ``clef:///home/<username>/.clef/clef.ipc``
+      (on MacOS, ``ipc:///Users/<username>/Library/Signer/clef.ipc``)
+    * If you ran ``geth`` node as above, your ``<PROVIDER>`` is ``ipc:///home/<username>/.ethereum/geth.ipc``
+      (on MacOS, ``ipc:///Users/<username>/Library/Ethereum/geth.ipc``)
+    * ``<NETWORK_NAME>`` is the name of the NuCypher network domain where the staker will participate.
 
-.. note:: If you're participating in NuCypher's incentivized testnet, this name is ``cassandra``.
+
+.. note:: If you are using NuCypher's testnet, this name is ``gemini``.
 
 
 Initialize a new stake
-~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~
 
 Once you have configured nucypher for staking, you can proceed with stake initiation.
 This operation will transfer an amount of tokens to nucypher's staking escrow contract and lock them for
 the commitment period.
 
-.. note:: Use ``--hw-wallet`` if you are using a hardware wallet to prevent password prompts.
+.. note:: Use ``--hw-wallet`` if you are using a hardware wallet or clef to prevent password prompts.
 
 .. code:: bash
 
+
     (nucypher)$ nucypher stake create --hw-wallet
 
-    Select staking account [0]: 0
-    Enter stake value in NU [15000]: 15000
-    Enter stake duration (30 periods minimum): 30
+        Account
+    --  ------------------------------------------
+     0  0x63e478bc474eBb6c31568ff131cCd95C24bfD552
+     1  0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f
+     2  0x45D33d1Ff0A7E696556f36DE697E5C92C2CCcFaE
+    Select index of staking account [0]: 1
+    Selected 1: 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f
+    Enter stake value in NU (15000 NU - 30000 NU) [30000]: 30000
+    Enter stake duration (30 - 47103) [365]: 30
 
-    ============================== STAGED STAKE ==============================
+    ══════════════════════════════ STAGED STAKE ══════════════════════════════
 
-    Staking address: 0xbb01c4fE50f91eF73c5dD6eD89f38D55A6b1EdCA
-    ~ Chain      -> ID # 5 | Goerli
-    ~ Value      -> 15000 NU (1.50E+22 NuNits)
+    Staking address: 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f
+    ~ Chain      -> ID # <CHAIN_ID>
+    ~ Value      -> 30000 NU (30000000000000000000000 NuNits)
     ~ Duration   -> 30 Days (30 Periods)
-    ~ Enactment  -> 2019-08-19 09:51:16.704875+00:00 (period #18127)
-    ~ Expiration -> 2019-09-18 09:51:16.705113+00:00 (period #18157)
+    ~ Enactment  -> Jun 19 20:00 EDT (period #18433)
+    ~ Expiration -> Jul 19 20:00 EDT (period #18463)
 
-    =========================================================================
+    ═════════════════════════════════════════════════════════════════════════
 
     * Ursula Node Operator Notice *
     -------------------------------
 
-    By agreeing to stake 15000 NU (15000000000000000000000 NuNits):
+    By agreeing to stake 30000 NU (30000000000000000000000 NuNits):
 
     - Staked tokens will be locked for the stake duration.
 
     - You are obligated to maintain a networked and available Ursula-Worker node
-      bonded to the staker address 0xbb01c4fE50f91eF73c5dD6eD89f38D55A6b1EdCA for the duration
+      bonded to the staker address 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f for the duration
       of the stake(s) (30 periods).
 
     - Agree to allow NuCypher network users to carry out uninterrupted re-encryption
@@ -215,13 +234,6 @@ the commitment period.
     Accept ursula node operator obligation? [y/N]: y
     Publish staged stake to the blockchain? [y/N]: y
 
-    Stake initialization transaction was successful.
-
-    Transaction details:
-    OK | deposit stake | 0xe05babab52d00157d0c6e95b7c5165a95adc0ee7ff64ca4d89807805f0ef0fcf (229181 gas)
-    Block #16 | 0xbf8252bc84831c26fc91a2272047e394ec0356af515d785d4a179596e722d836
-
-    StakingEscrow address: 0xDe09E74d4888Bc4e65F589e8c13Bce9F71DdF4c7
 
 If you used a hardware wallet, you will need to confirm two transactions here.
 
@@ -235,16 +247,24 @@ Once you have created one or more stakes, you can view all active stake for conn
 
     (nucypher)$ nucypher stake list
 
-    ======================================= Active Stakes =========================================
+    Network <NETWORK_NAME> ═══════════════════════════════
+    Staker 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f ════
+    Worker NO_WORKER_BONDED ════
+    --------------  -----------------------------------
+    Status          Never Made a Commitment (New Stake)
+    Restaking       Yes (Unlocked)
+    Winding Down    No
+    Unclaimed Fees  0 ETH
+    Min fee rate    0 ETH
+    --------------  -----------------------------------
+    ╒═══════╤══════════╤═════════════╤═════════════╤═══════════════╕
+    │   Idx │ Value    │   Remaining │ Enactment   │ Termination   │
+    ╞═══════╪══════════╪═════════════╪═════════════╪═══════════════╡
+    │ 	0   │ 30000 NU │      	  31 │ Jun 19 2020 │ Jul 19 2020   │
+    ╘═══════╧══════════╧═════════════╧═════════════╧═══════════════╛
 
-    | ~ | Staker | Worker | # | Value    | Duration     | Enactment
-    |   | ------ | ------ | - | -------- | ------------ | -----------------------------------------
-    | 0 | 0xbb01 | 0xdead | 0 | 15000 NU | 41 periods . | Aug 04 12:15:16 CEST - Sep 13 12:15:16 CEST
-    | 1 | 0xbb02 | 0xbeef | 1 | 15000 NU | 30 periods . | Aug 20 12:15:16 CEST - Sep 18 12:15:16 CEST
-    | 2 | 0xbb03 | 0x0000 | 0 | 30000 NU | 30 periods . | Aug 09 12:15:16 CEST - Sep 9 12:15:16 CEST
-
-If the Worker in the list is shown as ``0x0000``, it means that you haven't yet
-attached a Worker node to your Staker, so you still have to do it!
+If the Worker in the list is shown as ``NO_WORKER_BONDED``, it means that you haven't yet
+bonded a Worker node to your Staker, so you still have to do it!
 
 .. _bond-worker:
 
@@ -254,38 +274,36 @@ Bonding a Worker
 After initiating a stake, the staker must delegate access to a work address through *bonding*.
 There is a 1:1 relationship between the roles: A Staker may have multiple Stakes but only ever has one Worker at a time.
 
-.. note:: The Worker cannot be changed for a minimum of 2 periods once set.
+.. note:: The Worker cannot be changed for a minimum of 2 periods once bonded.
 
-.. note:: Stakers without a worker bonded will be highlighted in yellow (sometimes called "Detached" or "Headless").
+.. note:: Stakers without a worker bonded will be highlighted in red.
 
 .. code:: bash
 
-    (nucypher)$ nucypher stake set-worker --hw-wallet
+    (nucypher)$ nucypher stake bond-worker --hw-wallet
 
-    ======================================= Active Stakes =========================================
+            Account
+    --  ------------------------------------------
+     0  0x63e478bc474eBb6c31568ff131cCd95C24bfD552
+     1  0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f
+     2  0x45D33d1Ff0A7E696556f36DE697E5C92C2CCcFaE
+    Select index of staking account [0]: 1
+    Selected 1: 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f
+    Enter worker address: 0x45D33d1Ff0A7E696556f36DE697E5C92C2CCcFaE
+    Commit to bonding worker 0x45D33d1Ff0A7E696556f36DE697E5C92C2CCcFaE to staker 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f for a minimum of 2 periods? [y/N]: y
 
-    | ~ | Staker | Worker | # | Value    | Duration     | Enactment
-    |   | ------ | ------ | - | -------- | ------------ | -----------------------------------------
-    | 0 | 0xbb01 | 0xdead | 0 | 15000 NU | 41 periods . | Aug 04 12:15:16 CEST - Sep 13 12:15:16 CEST
-    | 1 | 0xbb02 | 0xbeef | 1 | 15000 NU | 30 periods . | Aug 20 12:15:16 CEST - Sep 18 12:15:16 CEST
-    | 2 | 0xbb03 | 0x0000 | 0 | 30000 NU | 30 periods . | Aug 09 12:15:16 CEST - Sep 9 12:15:16 CEST
-
-    Select Stake: 2
-    Enter Worker Address: 0xbeefc4fE50f91eF73c5dD6eD89f38D55A6b1EdCA
-    Worker 0xbb04c4fE50f91eF73c5dD6eD89f38D55A6b1EdCA successfully bonded to staker 0xbb03...
-
-    OK!
 
 .. note:: The worker's address must be EIP-55 checksum valid, however, geth shows addresses in the normalized format.
           You can convert the normalized address to checksum format in geth console:
 
 .. code:: bash
 
-    $ geth attach ~/.ethereum/goerli/geth.ipc
+    $ geth attach ~/.ethereum/geth.ipc
     > eth.accounts
-    ["0x287a817426dd1ae78ea23e9918e2273b6733a43d", "0xc080708026a3a280894365efd51bb64521c45147"]
-    > web3.toChecksumAddress(eth.accounts[0])
-    "0x287A817426DD1AE78ea23e9918e2273b6733a43D"
+    ["0x63e478bc474ebb6c31568ff131ccd95c24bfd552", "0x270b3f8af5ba2b79ea3bd6a6efc7ecab056d3e3f", "0x45d33d1ff0a7e696556f36de697e5c92c2cccfae"]
+    > web3.toChecksumAddress(eth.accounts[2])
+    "0x45D33d1Ff0A7E696556f36DE697E5C92C2CCcFaE"
+
 
 After this step, you're finished with the Staker, and you can proceed to :ref:`ursula-config-guide`.
 
@@ -374,79 +392,82 @@ To divide an existing stake:
 
     (nucypher)$ nucypher stake divide --hw-wallet
 
-    Select Stake: 2
-    Enter target value (must be less than or equal to 30000 NU): 15000
-    Enter number of periods to extend: 1
+    Select Stake: 0
+    Enter target value (15000 NU - 16437.841006996376688377 NU): 15000
+    Enter number of periods to extend: 20
 
-    ============================== ORIGINAL STAKE ============================
+    ══════════════════════════════ ORIGINAL STAKE ════════════════════════════
 
-    Staking address: 0xbb0300106378096883ca067B198d9d98112760e7
-    ~ Original Stake: | - | 0xbb03 | 0xbb04 | 0 | 30000 NU | 39 periods . | Aug 09 12:29:44 CEST - Sep 16 12:29:44 CEST
+    Staking address: 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f
+    ~ Original Stake: | - | 0x270b | 0x45D3 | 0 | 31437.841006996376688377 NU | 33 periods . | Jun 19 20:00 EDT - Jul 22 20:00 EDT
 
 
-    ============================== STAGED STAKE ==============================
+    ══════════════════════════════ STAGED STAKE ══════════════════════════════
 
-    Staking address: 0xbb0300106378096883ca067B198d9d98112760e7
-    ~ Chain      -> ID # 5 | Goerli
-    ~ Value      -> 15000 NU (1.50E+22 NuNits)
-    ~ Duration   -> 39 Days (39 Periods)
-    ~ Enactment  -> 2019-08-09 10:29:49.844348+00:00 (period #18117)
-    ~ Expiration -> 2019-09-17 10:29:49.844612+00:00 (period #18156)
+    Staking address: 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f
+    ~ Chain      -> ID # 4 | Rinkeby
+    ~ Value      -> 15000 NU (15000000000000000000000 NuNits)
+    ~ Duration   -> 53 Days (53 Periods)
+    ~ Enactment  -> Jun 19 20:00 EDT (period #18433)
+    ~ Expiration -> Aug 11 20:00 EDT (period #18486)
 
-    =========================================================================
-    Is this correct? [y/N]: y
-    Enter password to unlock account 0xbb0300106378096883ca067B198d9d98112760e7:
-
+    ═════════════════════════════════════════════════════════════════════════
+    Publish stake division to the blockchain? [y/N]: y
+    Enter password to unlock account 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f:
+    Confirm transaction DIVIDESTAKE on hardware wallet... (76058 gwei @ 1000000000)
+    Broadcasting DIVIDESTAKE Transaction (76058 gwei @ 1000000000)...
     Successfully divided stake
-    OK | 0xfa30927f05967b9a752402db9faecf146c46eda0740bd3d67b9e86dd908b6572 (85128 gas)
-    Block #1146153 | 0x2f87bccff86bf48d18f8ab0f54e30236bce6ca5ea9f85f3165c7389f2ea44e45
-    See https://goerli.etherscan.io/tx/0xfa30927f05967b9a752402db9faecf146c46eda0740bd3d67b9e86dd908b6572
+    OK | 0x74ddd647de6eaca7ef0c485706ef526001d959a3c2eaa98699e087a7d259d08b (75349 gas)
+    Block #6711982 | 0xd1c6d6df257ecd05632550565edb709ae577066a60ca433bc4d23de5fb332009
+     See https://rinkeby.etherscan.io/tx/0x74ddd647de6eaca7ef0c485706ef526001d959a3c2eaa98699e087a7d259d08b
 
-    ======================================= Active Stakes =========================================
 
-    | ~ | Staker | Worker | # | Value    | Duration     | Enactment
-    |   | ------ | ------ | - | -------- | ------------ | -----------------------------------------
-    | 0 | 0xbb01 | 0xbb02 | 0 | 15000 NU | 41 periods . | Aug 04 12:29:44 CEST - Sep 13 12:29:44 CEST
-    | 1 | 0xbb01 | 0xbb02 | 1 | 15000 NU | 30 periods . | Aug 20 12:29:44 CEST - Sep 18 12:29:44 CEST
-    | 2 | 0xbb03 | 0xbb04 | 0 | 15000 NU | 39 periods . | Aug 09 12:30:38 CEST - Sep 16 12:30:38 CEST
-    | 3 | 0xbb03 | 0xbb04 | 1 | 15000 NU | 40 periods . | Aug 09 12:30:38 CEST - Sep 17 12:30:38 CEST
+    Network <NETWORK_NAME> ═══════════════════════════════
+    Staker 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f ════
+    Worker 0x45D33d1Ff0A7E696556f36DE697E5C92C2CCcFaE ════
+    --------------  ----------------
+    Status          Committed #18436
+    Restaking       Yes (Unlocked)
+    Winding Down    No
+    Unclaimed Fees  0 ETH
+    Min fee rate    0 ETH
+    --------------  ----------------
+    ╒═══════╤═════════════════════════════╤═════════════╤═════════════╤═══════════════╕
+    │   Idx │ Value                   	  │   Remaining │ Enactment   │ Termination   │
+    ╞═══════╪═════════════════════════════╪═════════════╪═════════════╪═══════════════╡
+    │ 	0   │ 16437.841006996376688377 NU │         31  │ Jun 19 2020 │ Jul 22 2020   │
+    ├───────┼─────────────────────────────┼─────────────┼─────────────┼───────────────┤
+    │ 	1   │ 15000 NU                	  │         51  │ Jun 19 2020 │ Aug 11 2020   │
+    ╘═══════╧═════════════════════════════╧═════════════╧═════════════╧═══════════════╛
+
 
 
 Collect rewards earned by the staker
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-NuCypher nodes earn two types of rewards: staking rewards (in NU) and policy rewards (i.e., service fees in ETH).
-To collect these rewards use ``nucypher stake collect-reward`` with flags ``--staking-reward`` and ``--policy-reward``
+NuCypher nodes earn two types of rewards: staking rewards (in NU) and policy fees (i.e., service fees in ETH).
+To collect these rewards use ``nucypher stake collect-reward`` with flags ``--staking-reward`` and ``--policy-fee``
 (or even both).
 
 While staking rewards can only be collected to the original staker account, you can decide which account receives
-policy rewards using the ``--withdraw-address <ETH_ADDRESS>`` flag.
+policy fees using the ``--withdraw-address <ETH_ADDRESS>`` flag.
 
 .. code:: bash
 
-    (nucypher)$ nucypher stake collect-reward --staking-reward --policy-reward --staking-address 0x287A817426DD1AE78ea23e9918e2273b6733a43D --hw-wallet
+    (nucypher)$ nucypher stake collect-reward --staking-reward --policy-fee --staking-address 0x270b3f8af5ba2B79ea3Bd6a6Efc7ecAB056d3E3f --hw-wallet
+    Collecting 228.340621510864128225 NU from staking rewards...
+    Confirm transaction WITHDRAW on hardware wallet... (500000 gwei @ 1000000000)
+    Broadcasting WITHDRAW Transaction (500000 gwei @ 1000000000)...
+    OK | 0x1c59af9353b016080fef9e93ddd03fde4260b6c282880db7b15fc0d4f28b2d34 (124491 gas)
+    Block #6728952 | 0xdadfef1767eb5bdc4bb4ad469a5f7aded44a87799dd2ee0edd6b6147951dbd3f
+     See https://rinkeby.etherscan.io/tx/0x1c59af9353b016080fef9e93ddd03fde4260b6c282880db7b15fc0d4f28b2d34
 
-     ____    __            __
-    /\  _`\ /\ \__        /\ \
-    \ \,\L\_\ \ ,_\    __ \ \ \/'\      __   _ __
-     \/_\__ \\ \ \/  /'__`\\ \ , <    /'__`\/\`'__\
-       /\ \L\ \ \ \_/\ \L\.\\ \ \\`\ /\  __/\ \ \/
-       \ `\____\ \__\ \__/.\_\ \_\ \_\ \____\\ \_\
-        \/_____/\/__/\/__/\/_/\/_/\/_/\/____/ \/_/
-
-    The Holder of Stakes.
-
-    Collecting 12.345 NU from staking rewards...
-
-    OK | 0xb0625030224e228198faa3ed65d43f93247cf6067aeb62264db6f31b5bf411fa (55062 gas)
-    Block #1245170 | 0x63e4da39056873adaf869674db4002e016c80466f38256a4c251516a0e25e547
-     See https://goerli.etherscan.io/tx/0xb0625030224e228198faa3ed65d43f93247cf6067aeb62264db6f31b5bf411fa
-
-    Collecting 0.978 ETH from policy rewards...
-
-    OK | 0xe6d555be43263702b74727ce29dc4bcd6e32019159ccb15120791dfda0975372 (25070 gas)
-    Block #1245171 | 0x0d8180a69213c240e2bf2045179976d5f18de56a82f17a9d59db54756b6604e4
-     See https://goerli.etherscan.io/tx/0xe6d555be43263702b74727ce29dc4bcd6e32019159ccb15120791dfda0975372
+    Collecting 1.0004E-13 ETH from policy fees...
+    Confirm transaction WITHDRAW on hardware wallet... (42070 gwei @ 1000000000)
+    Broadcasting WITHDRAW Transaction (42070 gwei @ 1000000000)...
+    OK | 0xba2afb864c24d783c5185429706c77a39e9053570de892a351dd86f7719fe58b (41656 gas)
+    Block #6728953 | 0x1238f61e8adf8bf42e022f5182b692aca5ec5bf45c70871156ca540055daaa94
+     See https://rinkeby.etherscan.io/tx/0xba2afb864c24d783c5185429706c77a39e9053570de892a351dd86f7719fe58b
 
 You can run ``nucypher stake accounts`` to verify that your staking compensation
 is indeed in your wallet. Use your favorite Ethereum wallet (MyCrypto or Metamask
@@ -455,6 +476,9 @@ that.
 
 Note that you will need to confirm two transactions if you collect both types of
 staking compensation if you use a hardware wallet.
+
+.. note:: If you want to withdraw all tokens when all of them are unlocked - 
+          make sure to call ``nucypher stake mint`` first to ensure the last reward is included
 
 Staking using a preallocation contract
 ---------------------------------------
@@ -484,11 +508,11 @@ For example, to create a stake:
     (nucypher)$ nucypher stake create --hw-wallet --allocation-filepath PATH
 
 
-Or to set a worker:
+Or to bond a worker:
 
 .. code:: bash
 
-    (nucypher)$ nucypher stake set-worker --hw-wallet --allocation-filepath PATH
+    (nucypher)$ nucypher stake bond-worker --hw-wallet --allocation-filepath PATH
 
 
 As an alternative to the ``--allocation-filepath`` flag, preallocation users

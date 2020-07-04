@@ -16,58 +16,66 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import json
-from base64 import b64encode, b64decode
+from base64 import b64decode, b64encode
 from collections import OrderedDict
-from functools import partial
-from json.decoder import JSONDecodeError
 from random import shuffle
-from typing import Dict, Iterable, List, Set, Tuple, Union
 
 import maya
 import time
-from bytestring_splitter import BytestringKwargifier, BytestringSplittingError
-from bytestring_splitter import BytestringSplitter, VariableLengthBytestring
+from bytestring_splitter import BytestringKwargifier, BytestringSplitter, BytestringSplittingError, \
+    VariableLengthBytestring
 from constant_sorrow import constants
 from constant_sorrow.constants import INCLUDED_IN_BYTESTRING, PUBLIC_ONLY, STRANGER_ALICE
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurve
 from cryptography.hazmat.primitives.serialization import Encoding
-from cryptography.x509 import load_pem_x509_certificate, Certificate, NameOID
+from cryptography.x509 import Certificate, NameOID, load_pem_x509_certificate
+from datetime import datetime
 from eth_utils import to_checksum_address
-from flask import request, Response
-from twisted.internet import threads
+from flask import Response, request
+from functools import partial
+from json.decoder import JSONDecodeError
+from sqlalchemy.exc import OperationalError
+from twisted.internet import reactor, stdio, threads
+from twisted.internet.task import LoopingCall
 from twisted.logger import Logger
+from typing import Dict, Iterable, List, Set, Tuple, Union
+from umbral import pre
+from umbral.keys import UmbralPublicKey
+from umbral.kfrags import KFrag
+from umbral.pre import UmbralCorrectnessError
+from umbral.signing import Signature
 
 import nucypher
 from nucypher.blockchain.eth.actors import BlockchainPolicyAuthor, Worker
-from nucypher.blockchain.eth.agents import StakingEscrowAgent, ContractAgency
+from nucypher.blockchain.eth.agents import ContractAgency, StakingEscrowAgent
+from nucypher.blockchain.eth.interfaces import BlockchainInterfaceFactory
 from nucypher.blockchain.eth.registry import BaseContractRegistry
+from nucypher.blockchain.eth.signers import Web3Signer
 from nucypher.blockchain.eth.token import WorkTracker
 from nucypher.characters.banners import ALICE_BANNER, BOB_BANNER, ENRICO_BANNER, URSULA_BANNER
 from nucypher.characters.base import Character, Learner
 from nucypher.characters.control.controllers import (
     WebController
 )
+from nucypher.characters.control.emitters import StdoutEmitter
 from nucypher.characters.control.interfaces import AliceInterface, BobInterface, EnricoInterface
-from nucypher.config.storages import NodeStorage, ForgetfulNodeStorage
-from nucypher.crypto.api import keccak_digest, encrypt_and_sign
-from nucypher.crypto.constants import PUBLIC_KEY_LENGTH, PUBLIC_ADDRESS_LENGTH
+from nucypher.cli.processes import UrsulaCommandProtocol
+from nucypher.config.storages import ForgetfulNodeStorage, NodeStorage
+from nucypher.crypto.api import encrypt_and_sign, keccak_digest
+from nucypher.crypto.constants import PUBLIC_ADDRESS_LENGTH, PUBLIC_KEY_LENGTH
 from nucypher.crypto.kits import UmbralMessageKit
-from nucypher.crypto.powers import SigningPower, DecryptingPower, DelegatingPower, TransactingPower, PowerUpError
+from nucypher.crypto.powers import DecryptingPower, DelegatingPower, PowerUpError, SigningPower, TransactingPower
 from nucypher.crypto.signing import InvalidSignature
-from nucypher.keystore.keypairs import HostingKeypair
-from nucypher.keystore.threading import ThreadedSession
+from nucypher.datastore.keypairs import HostingKeypair
+from nucypher.datastore.threading import ThreadedSession
 from nucypher.network.exceptions import NodeSeemsToBeDown
 from nucypher.network.middleware import RestMiddleware
 from nucypher.network.nicknames import nickname_from_seed
-from nucypher.network.nodes import Teacher, NodeSprout
+from nucypher.network.nodes import NodeSprout, Teacher
 from nucypher.network.protocols import InterfaceInfo, parse_node_uri
 from nucypher.network.server import ProxyRESTServer, TLSHostingPower, make_rest_app
-from umbral import pre
-from umbral.keys import UmbralPublicKey
-from umbral.kfrags import KFrag
-from umbral.pre import UmbralCorrectnessError
-from umbral.signing import Signature
+from nucypher.network.trackers import AvailabilityTracker
 
 
 class Alice(Character, BlockchainPolicyAuthor):
@@ -80,13 +88,14 @@ class Alice(Character, BlockchainPolicyAuthor):
                  # Mode
                  is_me: bool = True,
                  federated_only: bool = False,
+                 signer = None,
 
                  # Ownership
                  checksum_address: str = None,
                  client_password: str = None,
                  cache_password: bool = False,
 
-                 # Ursulas
+                 # M of N
                  m: int = None,
                  n: int = None,
 
@@ -122,11 +131,13 @@ class Alice(Character, BlockchainPolicyAuthor):
                            network_middleware=network_middleware,
                            *args, **kwargs)
 
-        if is_me and not federated_only:
+        if is_me and not federated_only:  # TODO: #289
+            blockchain = BlockchainInterfaceFactory.get_interface(provider_uri=self.provider_uri)
             transacting_power = TransactingPower(account=self.checksum_address,
                                                  password=client_password,
-                                                 provider_uri=self.provider_uri,
-                                                 cache=cache_password)
+                                                 cache=cache_password,
+                                                 signer=signer or Web3Signer(blockchain.client))
+
             self._crypto_power.consume_power_up(transacting_power)
             BlockchainPolicyAuthor.__init__(self,
                                             registry=self.registry,
@@ -780,15 +791,15 @@ class Bob(Character):
                     self.get_reencrypted_cfrags(work_order, retain_cfrags=retain_cfrags)
                 except NodeSeemsToBeDown as e:
                     # TODO: What to do here?  Ursula isn't supposed to be down.  NRN
-                    self.log.info(
-                        f"Ursula ({work_order.ursula}) seems to be down while trying to complete WorkOrder: {work_order}")
+                    self.log.info(f"Ursula ({work_order.ursula}) seems to be down while trying to complete WorkOrder: {work_order}")
                     continue
                 except self.network_middleware.NotFound:
                     # This Ursula claims not to have a matching KFrag.  Maybe this has been revoked?
                     # TODO: What's the thing to do here?  Do we want to track these Ursulas in some way in case they're lying?  567
-                    self.log.warn(
-                        f"Ursula ({work_order.ursula}) claims not to have the KFrag to complete WorkOrder: {work_order}.  Has accessed been revoked?")
+                    self.log.warn(f"Ursula ({work_order.ursula}) claims not to have the KFrag to complete WorkOrder: {work_order}.  Has accessed been revoked?")
                     continue
+                except self.network_middleware.UnexpectedResponse:
+                    raise # TODO: Handle this
 
                 for capsule, pre_task in work_order.tasks.items():
                     try:
@@ -873,12 +884,15 @@ class Bob(Character):
 
 
 class Ursula(Teacher, Character, Worker):
+
     banner = URSULA_BANNER
     _alice_class = Alice
 
     # TODO: Maybe this wants to be a registry, so that, for example,  NRN
     # TLSHostingPower still can enjoy default status, but on a different class  NRN
     _default_crypto_powerups = [SigningPower, DecryptingPower]
+
+    _pruning_interval = 60  # seconds
 
     class NotEnoughUrsulas(Learner.NotEnoughTeachers, StakingEscrowAgent.NotEnoughStakers):
         """
@@ -901,11 +915,14 @@ class Ursula(Teacher, Character, Worker):
                  is_me: bool = True,
                  interface_signature=None,
                  timestamp=None,
+                 availability_check: bool = True,
+                 prune_datastore: bool = True,
 
                  # Blockchain
                  decentralized_identity_evidence: bytes = constants.NOT_SIGNED,
                  checksum_address: str = None,
                  worker_address: str = None,  # TODO: deprecate, and rename to "checksum_address"
+                 block_until_ready: bool = True,  # TODO: Must be true in order to set staker address - Allow for manual staker addr to be passed too!
                  work_tracker: WorkTracker = None,
                  start_working_now: bool = True,
                  client_password: str = None,
@@ -926,7 +943,7 @@ class Ursula(Teacher, Character, Worker):
         #
 
         if domains is None:
-            # TODO: Clean up imports
+            # TODO: Move defaults to configuration, Off character.
             from nucypher.config.node import CharacterConfiguration
             domains = {CharacterConfiguration.DEFAULT_DOMAIN}
 
@@ -946,61 +963,69 @@ class Ursula(Teacher, Character, Worker):
                            known_node_class=Ursula,
                            **character_kwargs)
 
-        #
-        # Self-Ursula
-        #
-        # TODO: Better handle ephemeral staking self ursula <-- Is this still relevant?  571
-        self.log.debug(f"URSULA worker: {worker_address}, staker {checksum_address}")
-        if is_me is True:  # TODO: #429
+        if is_me:
+
+            # In-Memory TreasureMap tracking
             self._stored_treasure_maps = dict()
 
-            #
-            # Ursula is a Decentralized Worker
-            #
-            if not federated_only:
-                # Prepare a TransactingPower from worker node's transacting keys
-                self.transacting_power = TransactingPower(account=worker_address, password=client_password, cache=True)
-                self._crypto_power.consume_power_up(self.transacting_power)
+            # Learner
+            self._start_learning_now = start_learning_now
 
-                # Use this power to substantiate the stamp
-                self.substantiate_stamp()
-                self.log.debug(
-                    f"Created decentralized identity evidence: {self.decentralized_identity_evidence[:10].hex()}")
-                decentralized_identity_evidence = self.decentralized_identity_evidence
+            # Self-Health Checks
+            self._availability_check = availability_check
+            self._availability_tracker = AvailabilityTracker(ursula=self)
 
-                Worker.__init__(self,
-                                is_me=is_me,
-                                registry=self.registry,
-                                checksum_address=checksum_address,
-                                worker_address=worker_address,
-                                work_tracker=work_tracker,
-                                start_working_now=start_working_now)
+            # Arrangement Pruning
+            self.__pruning_task = None
+            self._prune_datastore = prune_datastore
+            self._arrangement_pruning_task = LoopingCall(f=self.__prune_arrangements)
 
         #
-        # ProxyRESTServer and TLSHostingPower #
+        # Ursula the Decentralized Worker (Self)
         #
+
+        if is_me and not federated_only:  # TODO: #429
+
+            # Prepare a TransactingPower from worker node's transacting keys
+            self.transacting_power = TransactingPower(account=worker_address,
+                                                      password=client_password,
+                                                      signer=self.signer,
+                                                      cache=True)
+            self._crypto_power.consume_power_up(self.transacting_power)
+
+            # Use this power to substantiate the stamp
+            self.substantiate_stamp()
+            self.log.debug(f"Created decentralized identity evidence: {self.decentralized_identity_evidence[:10].hex()}")
+            decentralized_identity_evidence = self.decentralized_identity_evidence
+
+            Worker.__init__(self,
+                            is_me=is_me,
+                            registry=self.registry,
+                            checksum_address=checksum_address,
+                            worker_address=worker_address,
+                            work_tracker=work_tracker,
+                            start_working_now=start_working_now,
+                            block_until_ready=block_until_ready)
+
         if not crypto_power or (TLSHostingPower not in crypto_power):
 
             #
-            # Ephemeral Self-Ursula
+            # Development Ursula
             #
+
             if is_me:
                 self.suspicious_activities_witnessed = {'vladimirs': [],
                                                         'bad_treasure_maps': [],
                                                         'freeriders': []}
 
-                #
                 # REST Server (Ephemeral Self-Ursula)
-                #
                 rest_app, datastore = make_rest_app(
                     this_node=self,
                     db_filepath=db_filepath,
                     serving_domains=domains,
                 )
 
-                #
-                # TLSHostingPower (Ephemeral Self-Ursula)
-                #
+                # TLSHostingPower (Ephemeral Powers and Private Keys)
                 tls_hosting_keypair = HostingKeypair(curve=tls_curve, host=rest_host,
                                                      checksum_address=self.checksum_address)
                 tls_hosting_power = TLSHostingPower(keypair=tls_hosting_keypair, host=rest_host)
@@ -1011,6 +1036,7 @@ class Ursula(Teacher, Character, Worker):
             #
             # Stranger-Ursula
             #
+
             else:
 
                 # TLSHostingPower
@@ -1030,14 +1056,13 @@ class Ursula(Teacher, Character, Worker):
                     hosting_power=tls_hosting_power
                 )
 
-            #
             # OK - Now we have a ProxyRestServer and a TLSHostingPower for some Ursula
-            #
             self._crypto_power.consume_power_up(tls_hosting_power)  # Consume!
 
         #
-        # Verifiable Node
+        # Teacher (Verifiable Node)
         #
+
         certificate_filepath = self._crypto_power.power_ups(TLSHostingPower).keypair.certificate_filepath
         certificate = self._crypto_power.power_ups(TLSHostingPower).keypair.certificate
         Teacher.__init__(self,
@@ -1046,23 +1071,122 @@ class Ursula(Teacher, Character, Worker):
                          certificate_filepath=certificate_filepath,
                          interface_signature=interface_signature,
                          timestamp=timestamp,
-                         decentralized_identity_evidence=decentralized_identity_evidence,
-                         )
+                         decentralized_identity_evidence=decentralized_identity_evidence)
 
-        if start_learning_now:
-            self.start_learning_loop(now=True)
-
-        #
-        # Logging / Updating
-        #
         if is_me:
-            self.known_nodes.record_fleet_state(additional_nodes_to_track=[self])
+            self.known_nodes.record_fleet_state(additional_nodes_to_track=[self])  # Initial Impression
+
             message = "THIS IS YOU: {}: {}".format(self.__class__.__name__, self)
             self.log.info(message)
             self.log.info(self.banner.format(self.nickname))
         else:
             message = "Initialized Stranger {} | {}".format(self.__class__.__name__, self)
             self.log.debug(message)
+
+    def __prune_arrangements(self) -> None:
+        """Deletes all expired arrangements and kfrags in the datastore."""
+        now = datetime.fromtimestamp(self._arrangement_pruning_task.clock.seconds())
+        try:
+            result = self.datastore.del_expired_policy_arrangements(now=now)
+        except OperationalError:
+            self.log.warn(f"Failed to prune policy arrangements; DB session rolled back.")
+        else:
+            if result > 0:
+                self.log.debug(f"Pruned {result} policy arrangements.")
+
+    def run(self,
+            emitter: StdoutEmitter = None,
+            hendrix: bool = True,
+            learning: bool = True,
+            availability: bool = True,
+            worker: bool = True,
+            pruning: bool = True,
+            interactive: bool = False,
+            start_reactor: bool = True,
+            prometheus_config: 'PrometheusMetricsConfig' = None,
+            ) -> None:
+
+        """Schedule and start select ursula services, then optionally start the reactor."""
+
+        #
+        # Async loops ordered by schedule priority
+        #
+
+        if emitter:
+            emitter.message(f"Starting services...", color='yellow')
+
+        if pruning:
+            self.__pruning_task = self._arrangement_pruning_task.start(interval=self._pruning_interval, now=True)
+            if emitter:
+                emitter.message(f"✓ Database pruning", color='green')
+
+        if learning:
+            self.start_learning_loop(now=self._start_learning_now)
+            if emitter:
+                emitter.message(f"✓ Node Discovery ({','.join(self.learning_domains)})", color='green')
+
+        if self._availability_check and availability:
+            self._availability_tracker.start(now=False)  # wait...
+            if emitter:
+                emitter.message(f"✓ Availability Checks", color='green')
+
+        if worker and not self.federated_only:
+            self.work_tracker.start(act_now=True, requirement_func=self._availability_tracker.status)
+            if emitter:
+                emitter.message(f"✓ Work Tracking", color='green')
+
+        #
+        # Non-order dependant services
+        #
+
+        if prometheus_config:
+            # Locally scoped to prevent import without prometheus explicitly installed
+            from nucypher.utilities.prometheus.metrics import start_prometheus_exporter
+            # TODO: Integrate with Hendrix TLS Deploy?
+            start_prometheus_exporter(ursula=self, prometheus_config=prometheus_config)
+            if emitter:
+                emitter.message(f"✓ Prometheus Exporter", color='green')
+
+        if interactive and emitter:
+            stdio.StandardIO(UrsulaCommandProtocol(ursula=self, emitter=emitter))
+
+        if hendrix:
+
+            if emitter:
+                emitter.message(f"Starting Ursula on {self.rest_interface}", color='green', bold=True)
+
+            deployer = self.get_deployer()
+            deployer.addServices()
+            deployer.catalogServers(deployer.hendrix)
+
+            if not start_reactor:
+                return
+
+            if emitter:
+                emitter.message("Working ~ Keep Ursula Online!", color='blue', bold=True)
+
+            try:
+                deployer.run()  # <--- Blocking Call (Reactor)
+            except Exception as e:
+                self.log.critical(str(e))
+                if emitter:
+                    emitter.message(f"{e.__class__.__name__} {e}", color='red', bold=True)
+                raise  # Crash :-(
+
+        elif start_reactor:  # ... without hendrix
+            reactor.run()    # <--- Blocking Call (Reactor)
+
+    def stop(self, halt_reactor: bool = False) -> None:
+        """Stop services"""
+        self._availability_tracker.stop()
+        if self._learning_task.running:
+            self.stop_learning_loop()
+        if not self.federated_only:
+            self.work_tracker.stop()
+        if self._arrangement_pruning_task.running:
+            self._arrangement_pruning_task.stop()
+        if halt_reactor:
+            reactor.stop()
 
     def rest_information(self):
         hosting_power = self._crypto_power.power_ups(TLSHostingPower)
@@ -1185,7 +1309,7 @@ class Ursula(Teacher, Character, Worker):
                                  ) -> 'Ursula':
 
         if network_middleware is None:
-            network_middleware = RestMiddleware()
+            network_middleware = RestMiddleware(registry=registry)
 
         #
         # WARNING: xxx Poison xxx
@@ -1427,11 +1551,10 @@ class Enrico(Character):
         self.log = Logger(f'{self.__class__.__name__}-{bytes(self.public_keys(SigningPower)).hex()[:6]}')
         self.log.info(self.banner.format(policy_encrypting_key))
 
-    def encrypt_message(self,
-                        message: bytes
-                        ) -> Tuple[UmbralMessageKit, Signature]:
+    def encrypt_message(self, plaintext: bytes) -> Tuple[UmbralMessageKit, Signature]:
+        # TODO: #2107 Rename to "encrypt"
         message_kit, signature = encrypt_and_sign(self.policy_pubkey,
-                                                  plaintext=message,
+                                                  plaintext=plaintext,
                                                   signer=self.stamp)
         message_kit.policy_pubkey = self.policy_pubkey  # TODO: We can probably do better here.  NRN
         return message_kit, signature

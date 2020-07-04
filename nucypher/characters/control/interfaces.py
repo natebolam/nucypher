@@ -1,14 +1,30 @@
-import functools
-from base64 import b64decode
-from typing import Union
+"""
+ This file is part of nucypher.
 
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+import functools
 import maya
+from typing import Union
 from umbral.keys import UmbralPublicKey
 
 from nucypher.characters.control.specifications import alice, bob, enrico
 from nucypher.crypto.kits import UmbralMessageKit
 from nucypher.crypto.powers import DecryptingPower, SigningPower
 from nucypher.crypto.utils import construct_policy_id
+from nucypher.datastore.datastore import NotFound
 
 
 def attach_schema(schema):
@@ -226,11 +242,11 @@ class BobInterface(CharacterPublicInterface):
 class EnricoInterface(CharacterPublicInterface):
 
     @attach_schema(enrico.EncryptMessage)
-    def encrypt_message(self, message: str):
+    def encrypt_message(self, plaintext: Union[str, bytes]):
         """
         Character control endpoint for encrypting data for a policy and
         receiving the messagekit (and signature) to give to Bob.
         """
-        message_kit, signature = self.character.encrypt_message(bytes(message, encoding='utf-8'))
+        message_kit, signature = self.character.encrypt_message(plaintext=plaintext)
         response_data = {'message_kit': message_kit, 'signature': signature}
         return response_data

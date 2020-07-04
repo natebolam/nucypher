@@ -16,47 +16,28 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 import contextlib
 from contextlib import suppress
-from typing import Dict, ClassVar, Set
-from typing import Optional
-from typing import Union, List
 
-from bytestring_splitter import BytestringSplitter
 from constant_sorrow import default_constant_splitter
-from constant_sorrow.constants import (
-    DO_NOT_SIGN,
-    NO_BLOCKCHAIN_CONNECTION,
-    NO_CONTROL_PROTOCOL,
-    NO_DECRYPTION_PERFORMED,
-    NO_NICKNAME,
-    NO_SIGNING_POWER,
-    SIGNATURE_TO_FOLLOW,
-    SIGNATURE_IS_ON_CIPHERTEXT,
-    STRANGER,
-    FEDERATED_ONLY
-)
+from constant_sorrow.constants import (DO_NOT_SIGN, NO_BLOCKCHAIN_CONNECTION, NO_CONTROL_PROTOCOL,
+                                       NO_DECRYPTION_PERFORMED, NO_NICKNAME, NO_SIGNING_POWER,
+                                       SIGNATURE_IS_ON_CIPHERTEXT, SIGNATURE_TO_FOLLOW, STRANGER)
 from cryptography.exceptions import InvalidSignature
 from eth_keys import KeyAPI as EthKeyAPI
-from eth_utils import to_checksum_address, to_canonical_address
+from eth_utils import to_canonical_address, to_checksum_address
+from typing import ClassVar, Dict, List, Optional, Set, Union
 from umbral.keys import UmbralPublicKey
 from umbral.signing import Signature
 
-from nucypher.blockchain.eth.agents import StakingEscrowAgent
-from nucypher.blockchain.eth.interfaces import BlockchainInterface
 from nucypher.blockchain.eth.registry import BaseContractRegistry, InMemoryContractRegistry
-from nucypher.characters.control.controllers import JSONRPCController, CLIController
+from nucypher.blockchain.eth.signers import Signer
+from nucypher.characters.control.controllers import CLIController, JSONRPCController
 from nucypher.config.keyring import NucypherKeyring
 from nucypher.config.node import CharacterConfiguration
 from nucypher.crypto.api import encrypt_and_sign
 from nucypher.crypto.kits import UmbralMessageKit
-from nucypher.crypto.powers import (
-    CryptoPower,
-    SigningPower,
-    DecryptingPower,
-    NoSigningPower,
-    CryptoPowerUp,
-    DelegatingPower
-)
-from nucypher.crypto.signing import signature_splitter, StrangerStamp, SignatureStamp
+from nucypher.crypto.powers import (CryptoPower, CryptoPowerUp, DecryptingPower, DelegatingPower, NoSigningPower,
+                                    SigningPower)
+from nucypher.crypto.signing import SignatureStamp, StrangerStamp, signature_splitter
 from nucypher.network.middleware import RestMiddleware
 from nucypher.network.nicknames import nickname_from_seed
 from nucypher.network.nodes import Learner
@@ -86,6 +67,7 @@ class Character(Learner):
                  crypto_power: CryptoPower = None,
                  crypto_power_ups: List[CryptoPowerUp] = None,
                  provider_uri: str = None,
+                 signer: Signer = None,
                  registry: BaseContractRegistry = None,
                  *args, **kwargs
                  ) -> None:
@@ -135,7 +117,7 @@ class Character(Learner):
         if federated_only:
             if registry or provider_uri:
                 raise ValueError(f"Cannot init federated-only character with {registry or provider_uri}.")
-        self.federated_only = bool(federated_only)  # type: bool
+        self.federated_only: bool = federated_only
 
         #
         # Powers
@@ -177,11 +159,11 @@ class Character(Learner):
 
         if is_me:
             self.treasure_maps = {}  # type: dict
-            self.network_middleware = network_middleware or RestMiddleware()
 
             #
             # Signing Power
             #
+            self.signer = signer
             try:
                 signing_power = self._crypto_power.power_ups(SigningPower)  # type: SigningPower
                 self._stamp = signing_power.get_signature_stamp()  # type: SignatureStamp
@@ -196,6 +178,9 @@ class Character(Learner):
                 self.registry = registry or InMemoryContractRegistry.from_latest_publication(network=list(domains)[0])  #TODO: #1580
             else:
                 self.registry = NO_BLOCKCHAIN_CONNECTION.bool_value(False)
+
+            # REST
+            self.network_middleware = network_middleware or RestMiddleware(registry=self.registry)
 
             #
             # Learner
@@ -233,7 +218,7 @@ class Character(Learner):
         #
         elif federated_only:
             try:
-                self._set_checksum_address()  # type: str
+                self._set_checksum_address()
             except NoSigningPower:
                 self._checksum_address = NO_BLOCKCHAIN_CONNECTION
             if checksum_address:

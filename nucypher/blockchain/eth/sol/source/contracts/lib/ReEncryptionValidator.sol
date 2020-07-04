@@ -1,4 +1,6 @@
-pragma solidity ^0.5.3;
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.1;
 
 import "contracts/lib/UmbralDeserializer.sol";
 import "contracts/lib/SignatureVerifier.sol";
@@ -11,9 +13,9 @@ library ReEncryptionValidator {
     using UmbralDeserializer for bytes;
 
 
-    //////////////////////////////////
+    //------------------------------//
     //   Umbral-specific constants  //
-    //////////////////////////////////
+    //------------------------------//
 
     // See parameter `u` of `UmbralParameters` class in pyUmbral
     // https://github.com/nucypher/pyUmbral/blob/master/umbral/params.py
@@ -22,9 +24,9 @@ library ReEncryptionValidator {
     uint256 public constant UMBRAL_PARAMETER_U_YCOORD = 0x7880ed56962d7c0ae44d6f14bb53b5fe64b31ea44a41d0316f3a598778f0f936;
 
 
-    //////////////////////////////////
+    //------------------------------//
     // SECP256K1-specific constants //
-    //////////////////////////////////
+    //------------------------------//
 
     // Base field order
     uint256 constant FIELD_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
@@ -410,7 +412,7 @@ library ReEncryptionValidator {
     /// @dev Based on the addition formulas from http://www.hyperelliptic.org/EFD/g1p/auto-code/shortw/jacobian-0/addition/add-2001-b.op3
     /// @param P An EC point in affine coordinates
     /// @param Q An EC point in affine coordinates
-    /// @return An EC point in Jacobian coordinates with the sum, represented by an array of 3 uint256
+    /// @return R An EC point in Jacobian coordinates with the sum, represented by an array of 3 uint256
     function addAffineJacobian(
     	uint[2] memory P,
     	uint[2] memory Q
@@ -437,7 +439,7 @@ library ReEncryptionValidator {
 
     /// @notice Point doubling in Jacobian coordinates
     /// @param P An EC point in Jacobian coordinates.
-    /// @return An EC point in Jacobian coordinates
+    /// @return Q An EC point in Jacobian coordinates
     function doubleJacobian(uint[3] memory P) internal pure returns (uint[3] memory Q) {
         uint256 z = P[2];
         if (z == 0)

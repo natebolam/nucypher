@@ -1,4 +1,6 @@
-pragma solidity ^0.5.3;
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.1;
 
 
 import "zeppelin/math/SafeMath.sol";
@@ -22,13 +24,15 @@ contract MultiSig {
     mapping (address => bool) public isOwner;
     address[] public owners;
 
-    // @notice Only this contract can call method
+    /**
+    * @notice Only this contract can call method
+    */
     modifier onlyThisContract() {
         require(msg.sender == address(this));
         _;
     }
 
-    function () external payable {}
+    receive() external payable {}
 
     /**
     * @param _required Number of required signings
@@ -103,7 +107,7 @@ contract MultiSig {
 
         emit Executed(msg.sender, nonce, _destination, _value);
         nonce = nonce.add(1);
-        (bool callSuccess,) = _destination.call.value(_value)(_data);
+        (bool callSuccess,) = _destination.call{value: _value}(_data);
         require(callSuccess);
     }
 
@@ -141,8 +145,15 @@ contract MultiSig {
                 break;
             }
         }
-        owners.length -= 1;
+        owners.pop();
         emit OwnerRemoved(_owner);
+    }
+
+    /**
+    * @notice Returns the number of owners of this MultiSig
+    */
+    function getNumberOfOwners() external view returns (uint256) {
+        return owners.length;
     }
 
     /**

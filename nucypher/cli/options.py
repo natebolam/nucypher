@@ -16,13 +16,13 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from collections import namedtuple
-import functools
-import os
 
 import click
+import functools
+import os
+from twisted.python.log import Logger
 
 from nucypher.blockchain.eth.constants import NUCYPHER_CONTRACT_NAMES
-from nucypher.blockchain.eth.networks import NetworksInventory
 from nucypher.cli.types import (
     EIP55_CHECKSUM_ADDRESS,
     EXISTING_READABLE_FILE,
@@ -30,8 +30,8 @@ from nucypher.cli.types import (
     WEI
 )
 
-
 # Alphabetical
+
 option_checksum_address = click.option('--checksum-address', help="Run with a specified account", type=EIP55_CHECKSUM_ADDRESS)
 option_config_file = click.option('--config-file', help="Path to configuration file", type=EXISTING_READABLE_FILE)
 option_config_root = click.option('--config-root', help="Custom configuration directory", type=click.Path())
@@ -49,8 +49,7 @@ option_light = click.option('--light', help="Indicate that node is light", is_fl
 option_m = click.option('--m', help="M-Threshold KFrags", type=click.INT)
 option_min_stake = click.option('--min-stake', help="The minimum stake the teacher must have to be a teacher", type=click.INT, default=0)
 option_n = click.option('--n', help="N-Total KFrags", type=click.INT)
-option_network = click.option('--network', help="Network Domain Name", type=click.STRING)  # TODO
-option_poa = click.option('--poa', help="Inject POA middleware", is_flag=True, default=None)
+option_poa = click.option('--poa/--disable-poa', help="Inject POA middleware", is_flag=True, default=None)
 option_registry_filepath = click.option('--registry-filepath', help="Custom contract registry filepath", type=EXISTING_READABLE_FILE)
 option_staking_address = click.option('--staking-address', help="Address of a NuCypher staker", type=EIP55_CHECKSUM_ADDRESS)
 option_teacher_uri = click.option('--teacher', 'teacher_uri', help="An Ursula URI to start learning from (seednode)", type=click.STRING)
@@ -96,6 +95,15 @@ def option_message_kit(required: bool = False):
         required=required)
 
 
+def option_network(required: bool = False, default=os.environ.get("NUCYPHER_NETWORK")):
+    return click.option(
+        '--network',
+        help="Nucypher Network/Domain Name",
+        type=click.STRING,
+        required=required,
+        default=default)
+
+
 def option_policy_encrypting_key(required: bool = False):
     return click.option(
         '--policy-encrypting-key',
@@ -104,13 +112,14 @@ def option_policy_encrypting_key(required: bool = False):
         required=required)
 
 
-def option_provider_uri(default=os.environ.get("NUCYPHER_PROVIDER_URI"), required: bool = False):
+def option_provider_uri(default=None, required: bool = False):
     return click.option(
         '--provider', 'provider_uri',
         help="Blockchain provider's URI i.e. 'file:///path/to/geth.ipc'",
         type=click.STRING,
         required=required,
-        default=default)
+        default=default
+    )
 
 
 def group_options(option_class, **options):
@@ -175,14 +184,21 @@ def wrap_option(handler, **options):
     return _decorator
 
 
-def process_middleware(mock_networking):
-    from nucypher.network.middleware import RestMiddleware
-    from nucypher.utilities.sandbox.middleware import MockRestMiddleware
+def process_middleware(mock_networking) -> tuple:
+    #################
+    # MUST NOT RAISE!
+    #################
+    try:
+        from tests.utils.middleware import MockRestMiddleware
+    except ImportError:
+        # It's okay to to not crash here despite not having the tests package available.
+        logger = Logger("CLI-Middleware-Optional-Handler")
+        logger.info('--mock-networking flag is unavailable without dev install.')
     if mock_networking:
         middleware = MockRestMiddleware()
     else:
+        from nucypher.network.middleware import RestMiddleware
         middleware = RestMiddleware()
-
     return 'middleware', middleware
 
 
@@ -190,3 +206,4 @@ option_middleware = wrap_option(
     process_middleware,
     mock_networking=click.option('-Z', '--mock-networking', help="Use in-memory transport instead of networking", count=True),
     )
+option_signer_uri = click.option('--signer', 'signer_uri', '-S', default=None, type=str)

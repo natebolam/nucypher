@@ -17,21 +17,16 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 
 from _pydecimal import Decimal
 from collections import UserList
-from typing import Union, Tuple, Dict
 
 import maya
-from constant_sorrow.constants import (
-    NEW_STAKE,
-    NO_STAKING_RECEIPT,
-    NOT_STAKING,
-    EMPTY_STAKING_SLOT,
-    UNKNOWN_WORKER_STATUS
-)
+from constant_sorrow.constants import (EMPTY_STAKING_SLOT, NEW_STAKE, NOT_STAKING, NO_STAKING_RECEIPT,
+                                       UNKNOWN_WORKER_STATUS)
 from eth_utils import currency, is_checksum_address
-from twisted.internet import task, reactor
+from twisted.internet import reactor, task
 from twisted.logger import Logger
+from typing import Callable, Dict, Tuple, Union
 
-from nucypher.blockchain.eth.agents import StakingEscrowAgent, ContractAgency
+from nucypher.blockchain.eth.agents import ContractAgency, StakingEscrowAgent
 from nucypher.blockchain.eth.decorators import validate_checksum_address
 from nucypher.blockchain.eth.registry import BaseContractRegistry
 from nucypher.blockchain.eth.utils import datetime_at_period
@@ -190,9 +185,9 @@ class Stake:
 
         # TODO: #1502 - Move Me Brightly - Docs
         # After this period has passes, workers can go offline, if this is the only stake.
-        # This is the last period that can be confirmed for this stake.
-        # Meaning, It must be confirmed in the previous period,
-        # and no confirmation can be performed in this period for this stake.
+        # This is the last period that can be committed for this stake.
+        # Meaning, It must be committed in the previous period,
+        # and no commitment can be made in this period for this stake.
         self.final_locked_period = final_locked_period
 
         # Blockchain
@@ -217,8 +212,33 @@ class Stake:
         self.receipt = NO_STAKING_RECEIPT
 
     def __repr__(self) -> str:
-        r = f'Stake(index={self.index}, value={self.value}, end_period={self.final_locked_period})'
+        r = f'Stake(' \
+            f'index={self.index}, ' \
+            f'value={self.value}, ' \
+            f'end_period={self.final_locked_period}, ' \
+            f'address={self.staker_address[:6]}, ' \
+            f'escrow={self.staking_agent.contract_address[:6]}' \
+            f')'
         return r
+
+    def __eq__(self, other: 'Stake') -> bool:
+        this_stake = (self.index,
+                      self.value,
+                      self.first_locked_period,
+                      self.final_locked_period,
+                      self.staker_address,
+                      self.staking_agent.contract_address)
+        try:
+            that_stake = (other.index,
+                          other.value,
+                          other.first_locked_period,
+                          other.final_locked_period,
+                          other.staker_address,
+                          other.staking_agent.contract_address)
+        except AttributeError:
+            return False
+
+        return this_stake == that_stake
 
     @property
     def address_index_ordering_key(self):
@@ -292,7 +312,7 @@ class Stake:
             result = self.unlock_datetime.slang_date()
         else:
             # TODO - #1509 EthAgent?
-            blocktime_epoch = self.staking_agent.blockchain.client.w3.eth.getBlock('latest').timestamp
+            blocktime_epoch = self.staking_agent.blockchain.client.get_blocktime()
             delta = self.unlock_datetime.epoch - blocktime_epoch
             result = delta
         return result
@@ -484,11 +504,13 @@ class WorkTracker:
     CLOCK = reactor
     REFRESH_RATE = 60 * 15  # Fifteen minutes
 
-    def __init__(self, worker, refresh_rate: int = None, *args, **kwargs):
+    def __init__(self,
+                 worker,
+                 refresh_rate: int = None,
+                 *args, **kwargs):
 
         super().__init__(*args, **kwargs)
         self.log = Logger('stake-tracker')
-
         self.worker = worker
         self.staking_agent = self.worker.staking_agent
 
@@ -496,6 +518,7 @@ class WorkTracker:
         self._tracking_task = task.LoopingCall(self._do_work)
         self._tracking_task.clock = self.CLOCK
 
+        self.__requirement = None
         self.__current_period = None
         self.__start_time = NOT_STAKING
         self.__uptime_period = NOT_STAKING
@@ -506,10 +529,11 @@ class WorkTracker:
         return self.__current_period
 
     def stop(self) -> None:
-        self._tracking_task.stop()
-        self.log.info(f"STOPPED WORK TRACKING")
+        if self._tracking_task.running:
+            self._tracking_task.stop()
+            self.log.info(f"STOPPED WORK TRACKING")
 
-    def start(self, act_now: bool = False, force: bool = False) -> None:
+    def start(self, act_now: bool = False, requirement_func: Callable = None, force: bool = False) -> None:
         """
         High-level stake tracking initialization, this function aims
         to be safely called at any time - For example, it is okay to call
@@ -518,17 +542,17 @@ class WorkTracker:
         if self._tracking_task.running and not force:
             return
 
+        # Add optional confirmation requirement callable
+        self.__requirement = requirement_func
+
         # Record the start time and period
         self.__start_time = maya.now()
         self.__uptime_period = self.staking_agent.get_current_period()
         self.__current_period = self.__uptime_period
 
-        d = self._tracking_task.start(interval=self._refresh_rate)
+        self.log.info(f"START WORK TRACKING")
+        d = self._tracking_task.start(interval=self._refresh_rate, now=act_now)
         d.addErrback(self.handle_working_errors)
-        self.log.info(f"STARTED WORK TRACKING")
-
-        if act_now:
-            self._do_work()
 
     def _crash_gracefully(self, failure=None) -> None:
         """
@@ -541,10 +565,24 @@ class WorkTracker:
     def handle_working_errors(self, *args, **kwargs) -> None:
         failure = args[0]
         if self._abort_on_error:
-            self.log.critical(f"Unhandled error during node work tracking. {failure}")
+            self.log.critical('Unhandled error during node work tracking. {failure!r}',
+                              failure=failure)
             reactor.callFromThread(self._crash_gracefully, failure=failure)
         else:
-            self.log.warn(f"Unhandled error during work tracking: {failure.getTraceback()}")
+            self.log.warn('Unhandled error during work tracking: {failure.getTraceback()!r}',
+                          failure=failure)
+
+    def __check_work_requirement(self) -> bool:
+        # TODO: Check for stake expiration and exit
+        if self.__requirement is None:
+            return True
+        try:
+            r = self.__requirement()
+            if not isinstance(r, bool):
+                raise ValueError(f"'requirement' must return a boolean.")
+        except TypeError:
+            raise ValueError(f"'requirement' must be a callable.")
+        return r
 
     def _do_work(self) -> None:
         # TODO: #1515 Shut down at end of terminal stake
@@ -554,21 +592,28 @@ class WorkTracker:
         onchain_period = self.staking_agent.get_current_period()  # < -- Read from contract
         if self.current_period != onchain_period:
             self.__current_period = onchain_period
-            # self.worker.stakes.refresh()  # TODO: #1517 Move this a better location
+            # self.worker.stakes.refresh()  # TODO: #1517 Track stakes for fast access to terminal period.
 
         # Measure working interval
-        interval = onchain_period - self.worker.last_active_period
+        interval = onchain_period - self.worker.last_committed_period
         if interval < 0:
-            return  # No need to confirm this period.  Save the gas.
+            return  # No need to commit to this period.  Save the gas.
         if interval > 0:
             # TODO: #1516 Follow-up actions for downtime
-            self.log.warn(f"MISSED CONFIRMATIONS - {interval} missed staking confirmations detected.")
+            self.log.warn(f"MISSED COMMITMENTS - {interval} missed staking commitments detected.")
 
-        # Confirm Activity
-        self.log.info("Confirmed activity for period {}".format(self.current_period))
+        # Only perform work this round if the requirements are met
+        if not self.__check_work_requirement():
+            self.log.warn(f'COMMIT PREVENTED (callable: "{self.__requirement.__name__}") - '
+                          f'There are unmet commit requirements.')
+            # TODO: Follow-up actions for downtime
+            return
+
+        # Make a Commitment
+        self.log.info("Made a commitment to period {}".format(self.current_period))
         transacting_power = self.worker.transacting_power
         with transacting_power:
-            self.worker.confirm_activity()  # < --- blockchain WRITE
+            self.worker.commit_to_next_period()  # < --- blockchain WRITE
 
 
 class StakeList(UserList):

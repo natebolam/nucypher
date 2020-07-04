@@ -1,9 +1,33 @@
-import click
+"""
+ This file is part of nucypher.
 
-from nucypher.characters.banners import BOB_BANNER
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+"""
+import base64
+
+import click
+import ipfshttpclient
+
+from nucypher.characters.control.emitters import StdoutEmitter
 from nucypher.characters.control.interfaces import BobInterface
-from nucypher.cli import actions, painting
-from nucypher.cli.actions import get_nucypher_password, select_client_account, get_or_update_configuration
+from nucypher.cli.actions.auth import get_nucypher_password
+from nucypher.cli.actions.configure import (
+    destroy_configuration,
+    get_or_update_configuration,
+    handle_missing_configuration_file
+)
+from nucypher.cli.actions.select import select_client_account, select_config_file
 from nucypher.cli.commands.deploy import option_gas_strategy
 from nucypher.cli.config import group_general_config
 from nucypher.cli.options import (
@@ -22,22 +46,36 @@ from nucypher.cli.options import (
     option_network,
     option_provider_uri,
     option_registry_filepath,
-    option_teacher_uri,
+    option_signer_uri,
+    option_teacher_uri
 )
+from nucypher.cli.painting.help import paint_new_installation_help
+from nucypher.cli.utils import make_cli_character, setup_emitter
 from nucypher.config.characters import BobConfiguration
+from nucypher.config.constants import TEMPORARY_DOMAIN
 from nucypher.crypto.powers import DecryptingPower
-from nucypher.utilities.sandbox.constants import TEMPORARY_DOMAIN
+from nucypher.network.middleware import RestMiddleware
 
 
 class BobConfigOptions:
 
     __option_name__ = 'config_options'
 
-    def __init__(self, provider_uri, network, registry_filepath,
-                 checksum_address, discovery_port, dev, middleware, federated_only, gas_strategy):
+    def __init__(self, 
+                 provider_uri: str,
+                 network: str,
+                 registry_filepath: str,
+                 checksum_address: str,
+                 discovery_port: int,
+                 dev: bool,
+                 middleware: RestMiddleware,
+                 federated_only: bool,
+                 gas_strategy: str,
+                 signer_uri: str):
 
         self.provider_uri = provider_uri
-        self.gas_strategy = gas_strategy,
+        self.signer_uri = signer_uri
+        self.gas_strategy = gas_strategy
         self.domains = {network} if network else None
         self.registry_filepath = registry_filepath
         self.checksum_address = checksum_address
@@ -46,14 +84,15 @@ class BobConfigOptions:
         self.middleware = middleware
         self.federated_only = federated_only
 
-    def create_config(self, emitter, config_file):
+    def create_config(self, emitter: StdoutEmitter, config_file: str) -> BobConfiguration:
         if self.dev:
             return BobConfiguration(
                 emitter=emitter,
                 dev_mode=True,
                 domains={TEMPORARY_DOMAIN},
                 provider_uri=self.provider_uri,
-                gas_strategy=self.gas_strategy,
+                gas_strategy=self.gas_strategy,  # TODO: Fix type hint
+                signer_uri=self.signer_uri,
                 federated_only=True,
                 checksum_address=self.checksum_address,
                 network_middleware=self.middleware)
@@ -66,21 +105,21 @@ class BobConfigOptions:
                     checksum_address=self.checksum_address,
                     rest_port=self.discovery_port,
                     provider_uri=self.provider_uri,
+                    signer_uri=self.signer_uri,
                     gas_strategy=self.gas_strategy,
                     registry_filepath=self.registry_filepath,
                     network_middleware=self.middleware)
             except FileNotFoundError:
-                return actions.handle_missing_configuration_file(
-                    character_config_class=BobConfiguration,
-                    config_file=config_file)
+                handle_missing_configuration_file(character_config_class=BobConfiguration,
+                                                  config_file=config_file)
 
-    def generate_config(self, emitter, config_root):
+    def generate_config(self, emitter: StdoutEmitter, config_root: str) -> BobConfiguration:
 
         checksum_address = self.checksum_address
         if not checksum_address and not self.federated_only:
             checksum_address = select_client_account(emitter=emitter,
-                                                     provider_uri=self.provider_uri,
-                                                     show_balances=False)
+                                                     signer_uri=self.signer_uri,
+                                                     provider_uri=self.provider_uri)  # TODO: See #1888
 
         return BobConfiguration.generate(
             password=get_nucypher_password(confirm=True),
@@ -90,6 +129,7 @@ class BobConfigOptions:
             federated_only=self.federated_only,
             registry_filepath=self.registry_filepath,
             provider_uri=self.provider_uri,
+            signer_uri=self.signer_uri,
             gas_strategy=self.gas_strategy,
         )
 
@@ -99,6 +139,7 @@ class BobConfigOptions:
                        federated_only=self.federated_only,
                        registry_filepath=self.registry_filepath,
                        provider_uri=self.provider_uri,
+                       signer_uri=self.signer_uri,
                        gas_strategy=self.gas_strategy
                        )
         # Depends on defaults being set on Configuration classes, filtrates None values
@@ -110,33 +151,33 @@ group_config_options = group_options(
     BobConfigOptions,
     provider_uri=option_provider_uri(),
     gas_strategy=option_gas_strategy,
-    network=option_network,
+    signer_uri=option_signer_uri,
+    network=option_network(),
     registry_filepath=option_registry_filepath,
     checksum_address=option_checksum_address,
     discovery_port=option_discovery_port(),
     dev=option_dev,
     middleware=option_middleware,
     federated_only=option_federated_only
-    )
+)
 
 
 class BobCharacterOptions:
 
     __option_name__ = 'character_options'
 
-    def __init__(self, config_options, teacher_uri, min_stake):
+    def __init__(self, config_options: BobConfigOptions, teacher_uri: str, min_stake: int):
         self.config_options = config_options
         self.teacher_uri = teacher_uri
         self.min_stake = min_stake
 
     def create_character(self, emitter, config_file):
         config = self.config_options.create_config(emitter, config_file)
-
-        return actions.make_cli_character(character_config=config,
-                                          emitter=emitter,
-                                          unlock_keyring=not self.config_options.dev,
-                                          teacher_uri=self.teacher_uri,
-                                          min_stake=self.min_stake)
+        return make_cli_character(character_config=config,
+                                  emitter=emitter,
+                                  unlock_keyring=not self.config_options.dev,
+                                  teacher_uri=self.teacher_uri,
+                                  min_stake=self.min_stake)
 
 
 group_character_options = group_options(
@@ -149,10 +190,7 @@ group_character_options = group_options(
 
 @click.group()
 def bob():
-    """
-    "Bob the Data Recipient" management commands.
-    """
-    pass
+    """"Bob the Data Recipient" management commands."""
 
 
 @bob.command()
@@ -161,14 +199,12 @@ def bob():
 @option_config_root
 @group_general_config
 def init(general_config, config_options, config_root):
-    """
-    Create a brand new persistent Bob.
-    """
-    emitter = _setup_emitter(general_config)
+    """Create a brand new persistent Bob."""
+    emitter = setup_emitter(general_config)
     if not config_root:
         config_root = general_config.config_root
     new_bob_config = config_options.generate_config(emitter, config_root)
-    return painting.paint_new_installation_help(emitter, new_configuration=new_bob_config)
+    paint_new_installation_help(emitter, new_configuration=new_bob_config)
 
 
 @bob.command()
@@ -178,11 +214,10 @@ def init(general_config, config_options, config_root):
 @option_dry_run
 @group_general_config
 def run(general_config, character_options, config_file, controller_port, dry_run):
-    """
-    Start Bob's controller.
-    """
-    emitter = _setup_emitter(general_config)
+    """Start Bob's controller."""
 
+    # Setup
+    emitter = setup_emitter(general_config)
     BOB = character_options.create_character(emitter, config_file)
 
     # RPC
@@ -207,17 +242,17 @@ def run(general_config, character_options, config_file, controller_port, dry_run
 @group_config_options
 @group_general_config
 def config(general_config, config_options, config_file):
-    """
-    View and optionally update existing Bob's configuration.
-    """
-    emitter = _setup_emitter(general_config)
-    bob_config = config_options.create_config(emitter, config_file)
-    filepath = config_file or bob_config.config_file_location
-    emitter.echo(f"Bob Configuration {filepath} \n {'='*55}")
-    return get_or_update_configuration(emitter=emitter,
-                                       config_class=BobConfiguration,
-                                       filepath=filepath,
-                                       config_options=config_options)
+    """View and optionally update existing Bob's configuration."""
+    emitter = setup_emitter(general_config)
+    if not config_file:
+        config_file = select_config_file(emitter=emitter,
+                                         checksum_address=config_options.checksum_address,
+                                         config_class=BobConfiguration)
+    updates = config_options.get_updates()
+    get_or_update_configuration(emitter=emitter,
+                                config_class=BobConfiguration,
+                                filepath=config_file,
+                                updates=updates)
 
 
 @bob.command()
@@ -226,20 +261,13 @@ def config(general_config, config_options, config_file):
 @option_force
 @group_general_config
 def destroy(general_config, config_options, config_file, force):
-    """
-    Delete existing Bob's configuration.
-    """
-    emitter = _setup_emitter(general_config)
-
-    # Validate
+    """Delete existing Bob's configuration."""
+    emitter = setup_emitter(general_config)
     if config_options.dev:
         message = "'nucypher bob destroy' cannot be used in --dev mode"
         raise click.BadOptionUsage(option_name='--dev', message=message)
-
     bob_config = config_options.create_config(emitter, config_file)
-
-    # Request
-    return actions.destroy_configuration(emitter, character_config=bob_config, force=force)
+    destroy_configuration(emitter, character_config=bob_config, force=force)
 
 
 @bob.command(name='public-keys')
@@ -248,10 +276,8 @@ def destroy(general_config, config_options, config_file, force):
 @BobInterface.connect_cli('public_keys')
 @group_general_config
 def public_keys(general_config, character_options, config_file):
-    """
-    Obtain Bob's public verification and encryption keys.
-    """
-    emitter = _setup_emitter(general_config)
+    """Obtain Bob's public verification and encryption keys."""
+    emitter = setup_emitter(general_config)
     BOB = character_options.create_character(emitter, config_file)
     response = BOB.controller.public_keys()
     return response
@@ -262,13 +288,19 @@ def public_keys(general_config, character_options, config_file):
 @option_config_file
 @BobInterface.connect_cli('retrieve')
 @group_general_config
-def retrieve(general_config, character_options, config_file,
-             label, policy_encrypting_key, alice_verifying_key, message_kit):
-    """
-    Obtain plaintext from encrypted data, if access was granted.
-    """
-    emitter = _setup_emitter(general_config)
+@click.option('--ipfs', help="Download an encrypted message from IPFS at the specified gateway URI")
+def retrieve(general_config,
+             character_options,
+             config_file,
+             label,
+             policy_encrypting_key,
+             alice_verifying_key,
+             message_kit,
+             ipfs):
+    """Obtain plaintext from encrypted data, if access was granted."""
 
+    # Setup
+    emitter = setup_emitter(general_config)
     BOB = character_options.create_character(emitter, config_file)
 
     # Validate
@@ -276,6 +308,15 @@ def retrieve(general_config, character_options, config_file,
         input_specification, output_specification = BOB.control.get_specifications(interface_name='retrieve')
         required_fields = ', '.join(input_specification)
         raise click.BadArgumentUsage(f'{required_fields} are required flags to retrieve')
+
+    if ipfs:
+        # TODO: #2108
+        emitter.message(f"Connecting to IPFS Gateway {ipfs}")
+        ipfs_client = ipfshttpclient.connect(ipfs)
+        cid = message_kit  # Understand the message kit value as an IPFS hash.
+        raw_message_kit = ipfs_client.cat(cid)  # cat the contents at the hash reference
+        emitter.message(f"Downloaded message kit from IPFS (CID {cid})", color='green')
+        message_kit = raw_message_kit.decode()  # cast to utf-8
 
     # Request
     bob_request_data = {
@@ -287,12 +328,3 @@ def retrieve(general_config, character_options, config_file,
 
     response = BOB.controller.retrieve(request=bob_request_data)
     return response
-
-
-def _setup_emitter(general_config):
-    # Banner
-    emitter = general_config.emitter
-    emitter.clear()
-    emitter.banner(BOB_BANNER)
-
-    return emitter

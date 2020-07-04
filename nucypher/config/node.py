@@ -17,18 +17,19 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 
 
 import os
-from tempfile import TemporaryDirectory
-from typing import List, Set, Union, Callable
-
+import re
 from constant_sorrow.constants import (
-    UNINITIALIZED_CONFIGURATION,
-    NO_BLOCKCHAIN_CONNECTION,
-    LIVE_CONFIGURATION,
-    NO_KEYRING_ATTACHED,
     DEVELOPMENT_CONFIGURATION,
-    FEDERATED_ADDRESS
+    FEDERATED_ADDRESS,
+    LIVE_CONFIGURATION,
+    NO_BLOCKCHAIN_CONNECTION,
+    NO_KEYRING_ATTACHED,
+    UNINITIALIZED_CONFIGURATION
 )
+from eth_utils.address import is_checksum_address
+from tempfile import TemporaryDirectory
 from twisted.logger import Logger
+from typing import Callable, List, Set, Union
 from umbral.signing import Signature
 
 from nucypher.blockchain.eth.interfaces import BlockchainInterfaceFactory
@@ -38,10 +39,11 @@ from nucypher.blockchain.eth.registry import (
     InMemoryContractRegistry,
     LocalContractRegistry
 )
+from nucypher.blockchain.eth.signers import Signer
 from nucypher.config.base import BaseConfiguration
 from nucypher.config.keyring import NucypherKeyring
-from nucypher.config.storages import NodeStorage, ForgetfulNodeStorage, LocalFileBasedNodeStorage
-from nucypher.crypto.powers import CryptoPowerUp, CryptoPower
+from nucypher.config.storages import ForgetfulNodeStorage, LocalFileBasedNodeStorage, NodeStorage
+from nucypher.crypto.powers import CryptoPower, CryptoPowerUp
 from nucypher.network.middleware import RestMiddleware
 
 
@@ -65,6 +67,7 @@ class CharacterConfiguration(BaseConfiguration):
     def __init__(self,
 
                  # Base
+                 emitter=None,
                  config_root: str = None,
                  filepath: str = None,
 
@@ -98,19 +101,17 @@ class CharacterConfiguration(BaseConfiguration):
                  save_metadata: bool = True,
 
                  # Blockchain
-                 poa: bool = False,
+                 poa: bool = None,
                  light: bool = False,
                  sync: bool = False,
                  provider_uri: str = None,
                  provider_process=None,
                  gas_strategy: Union[Callable, str] = DEFAULT_GAS_STRATEGY,
+                 signer_uri: str = None,
 
                  # Registry
                  registry: BaseContractRegistry = None,
-                 registry_filepath: str = None,
-
-                 emitter=None,
-                 ):
+                 registry_filepath: str = None):
 
         self.log = Logger(self.__class__.__name__)
         UNINITIALIZED_CONFIGURATION.bool_value(False)
@@ -119,11 +120,6 @@ class CharacterConfiguration(BaseConfiguration):
         # NOTE: NodeConfigurations can only be used with Self-Characters
         self.is_me = True
         self.checksum_address = checksum_address
-
-        # Network
-        self.controller_port = controller_port or self.DEFAULT_CONTROLLER_PORT
-        self.network_middleware = network_middleware or self.DEFAULT_NETWORK_MIDDLEWARE()
-        self.interface_signature = interface_signature
 
         # Keyring
         self.crypto_power = crypto_power
@@ -145,6 +141,7 @@ class CharacterConfiguration(BaseConfiguration):
         self.is_light = light
         self.provider_uri = provider_uri or NO_BLOCKCHAIN_CONNECTION
         self.provider_process = provider_process or NO_BLOCKCHAIN_CONNECTION
+        self.signer_uri = signer_uri or NO_BLOCKCHAIN_CONNECTION
 
         # Learner
         self.federated_only = federated_only
@@ -177,7 +174,7 @@ class CharacterConfiguration(BaseConfiguration):
                                'provider_uri': provider_uri,
                                'gas_strategy': gas_strategy}
             if any(blockchain_args.values()):
-                bad_args = (f"{arg}={val}" for arg, val in blockchain_args.items() if val)
+                bad_args = ", ".join(f"{arg}={val}" for arg, val in blockchain_args.items() if val)
                 self.log.warn(f"Arguments {bad_args} are incompatible with federated_only. "
                               f"Overridden with a sane default.")
 
@@ -227,10 +224,53 @@ class CharacterConfiguration(BaseConfiguration):
             self._cache_runtime_filepaths()
             self.__setup_node_storage(node_storage=node_storage)
 
+        # Network
+        self.controller_port = controller_port or self.DEFAULT_CONTROLLER_PORT
+        self.network_middleware = network_middleware or self.DEFAULT_NETWORK_MIDDLEWARE(registry=self.registry)
+        self.interface_signature = interface_signature
+
         super().__init__(filepath=self.config_file_location, config_root=self.config_root)
 
     def __call__(self, **character_kwargs):
         return self.produce(**character_kwargs)
+
+    @classmethod
+    def checksum_address_from_filepath(cls, filepath: str) -> str:
+
+        pattern = re.compile(r'''
+                             (^\w+)-
+                             (0x{1}         # Then, 0x the start of the string, exactly once
+                             [0-9a-fA-F]{40}) # Followed by exactly 40 hex chars
+                             ''',
+                             re.VERBOSE)
+
+        filename = os.path.basename(filepath)
+        match = pattern.match(filename)
+
+        if match:
+            character_name, checksum_address = match.groups()
+
+        else:
+            # Extract from default by "peeking" inside the configuration file.
+            default_name = cls.generate_filename()
+            if filename == default_name:
+                checksum_address = cls.peek(filepath=filepath, field='checksum_address')
+
+                ###########
+                # TODO: Cleanup and deprecate worker_address in config files, leaving only checksum_address
+                from nucypher.config.characters import UrsulaConfiguration
+                if isinstance(cls, UrsulaConfiguration):
+                    federated = bool(cls.peek(filepath=filepath, field='federated_only'))
+                    if not federated:
+                        checksum_address = cls.peek(filepath=cls.filepath, field='worker_address')
+                ###########
+
+            else:
+                raise ValueError(f"Cannot extract checksum from filepath '{filepath}'")
+
+        if not is_checksum_address(checksum_address):
+            raise RuntimeError(f"Invalid checksum address detected in configuration file at '{filepath}'.")
+        return checksum_address
 
     def update(self, **kwargs) -> None:
         """
@@ -281,7 +321,13 @@ class CharacterConfiguration(BaseConfiguration):
         Warning: This method allows mutation and may result in an inconsistent configuration.
         """
         merged_parameters = {**self.static_payload(), **self.dynamic_payload, **overrides}
-        non_init_params = ('config_root', 'poa', 'light', 'provider_uri', 'registry_filepath', 'gas_strategy')
+        non_init_params = ('config_root',
+                           'poa',
+                           'light',
+                           'provider_uri',
+                           'registry_filepath',
+                           'gas_strategy',
+                           'signer_uri')
         character_init_params = filter(lambda t: t[0] not in non_init_params, merged_parameters.items())
         return dict(character_init_params)
 
@@ -318,10 +364,7 @@ class CharacterConfiguration(BaseConfiguration):
         """Initialize a CharacterConfiguration from a JSON file."""
         filepath = filepath or cls.default_filepath()
         assembled_params = cls.assemble(filepath=filepath, **overrides)
-        try:
-            node_configuration = cls(filepath=filepath, provider_process=provider_process, **assembled_params)
-        except TypeError as e:
-            raise cls.ConfigurationError(e)
+        node_configuration = cls(filepath=filepath, provider_process=provider_process, **assembled_params)
         return node_configuration
 
     def validate(self) -> bool:
@@ -362,7 +405,12 @@ class CharacterConfiguration(BaseConfiguration):
         # Optional values (mode)
         if not self.federated_only:
             if self.provider_uri:
-                payload.update(dict(provider_uri=self.provider_uri, poa=self.poa, light=self.is_light))
+                if not self.signer_uri:
+                    self.signer_uri = self.provider_uri
+                payload.update(dict(provider_uri=self.provider_uri,
+                                    poa=self.poa,
+                                    light=self.is_light,
+                                    signer_uri=self.signer_uri))
             if self.registry_filepath:
                 payload.update(dict(registry_filepath=self.registry_filepath))
 
@@ -380,7 +428,8 @@ class CharacterConfiguration(BaseConfiguration):
         """Exported dynamic configuration values for initializing Ursula"""
         payload = dict()
         if not self.federated_only:
-            payload.update(dict(registry=self.registry))
+            payload.update(dict(registry=self.registry,
+                                signer=Signer.from_signer_uri(self.signer_uri)))
 
         payload.update(dict(network_middleware=self.network_middleware or self.DEFAULT_NETWORK_MIDDLEWARE(),
                             known_nodes=self.known_nodes,

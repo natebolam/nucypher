@@ -1,4 +1,21 @@
 # -*- coding: utf-8 -*-
+"""
+ This file is part of nucypher.
+
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
 #
 # Configuration file for the Sphinx documentation builder.
 #
@@ -13,15 +30,14 @@
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
 import os
-import sys
 
-from recommonmark.parser import CommonMarkParser
+import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath('..'))
 
 
 # -- Project information -----------------------------------------------------
-from recommonmark.transform import AutoStructify
 
 project = 'NuCypher'
 copyright = '2019, NuCypher'
@@ -30,7 +46,7 @@ author = 'NuCypher'
 # The short X.Y version
 version = ''
 # The full version, including alpha/beta/rc tags
-release = '2.0.0-beta.7'
+release = '2.1.0-beta.12'
 
 
 # -- General configuration ---------------------------------------------------
@@ -43,15 +59,11 @@ release = '2.0.0-beta.7'
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.doctest',
-    'sphinx.ext.intersphinx',
-    'sphinx.ext.todo',
-    'sphinx.ext.coverage',
     'sphinx.ext.napoleon',
+    'sphinx.ext.autodoc',
+    'sphinx.ext.intersphinx',
+    'sphinx.ext.doctest',
     'sphinx.ext.mathjax',
-    'sphinx.ext.viewcode',
-    'aafigure.sphinxext',
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -61,12 +73,7 @@ templates_path = ['.templates']
 # You can specify multiple suffix as a list of string:
 #
 
-source_parsers = {
-    '.md': CommonMarkParser,
-}
-
-
-source_suffix = ['.rst', '.md', '.txt']
+source_suffix = '.rst'
 
 # The master toctree document.
 master_doc = 'index'
@@ -81,7 +88,11 @@ language = None
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = []
+exclude_patterns = [
+    'api/nucypher.rst',
+    'api/modules.rst',
+    'api/nucypher.cli*'
+]
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = None
@@ -195,25 +206,77 @@ epub_title = project
 epub_exclude_files = ['search.html']
 
 
-# -- Extension configuration -------------------------------------------------
+# -- Intersphinx configuration ------------------------------------------------
 
-# Example configuration for intersphinx: refer to the Python standard library.
-intersphinx_mapping = {'https://docs.python.org/': None}
+intersphinx_mapping = {
+    'python': ('https://docs.python.org/3.5', None),
+    'pyUbmbral': ('http://pyumbral.readthedocs.io/en/latest/', None),
+    'web3py': ('https://web3py.readthedocs.io/en/latest/', None),
+
+}
+
+# -- Autodoc configuration ----------------------------------------
 
 
-def remove_module_docstring(app, what, name, obj, options, lines):
+def remove_module_license(app, what, name, obj, options, lines):
     if what == "module":
         del lines[:]
 
 
-todo_include_todos = False
+def run_apidoc(_):
+    """# sphinx-apidoc [OPTIONS] -o <OUTPUT_PATH> <MODULE_PATH> [EXCLUDE_PATTERN …]"""
+
+    from sphinx.ext import apidoc
+
+    source_dir = Path(__file__).parent.resolve()
+    nucypher_module_dir = source_dir.parent.parent
+
+    # Command: sphinx-apidoc [OPTIONS] -o <OUTPUT_PATH> <MODULE_PATH> [EXCLUDE_PATTERN …]
+    apidoc_command = []
+
+    # ---- execution options/paths ----
+    apidoc_command.extend(['-fME',
+                           '-t', f'{source_dir / "apidoc"}',
+                           '-o', f'{source_dir / "api"}',
+                           f'{nucypher_module_dir}'])
+
+    # ---- exclusion patterns (*must be last to be added*) ----
+    # general patterns
+    apidoc_command.extend([
+        '*conftest*',
+    ])
+
+    # files/folders relative to `nucypher` project directory (results in required absolute paths)
+    exclusion_items = [
+        'setup.py',
+        'tests',
+        'scripts',
+        Path('nucypher', 'utilities'),
+        Path('nucypher', 'blockchain', 'eth', 'sol'),
+    ]
+    for exclusion_item in exclusion_items:
+        apidoc_command.append(f'{nucypher_module_dir / exclusion_item}')
+
+    # ---- execute command ----
+    apidoc.main(apidoc_command)
+
 
 def setup(app):
-    local_source_root = 'https://docs.nucypher.com/'
+    app.connect("autodoc-process-docstring", remove_module_license)
+    app.connect('builder-inited', run_apidoc)
 
-    app.add_config_value('recommonmark_config', {
-            'url_resolver': lambda url: local_source_root + url,
-            'auto_toc_tree_section': 'Contents',
-            }, True)
-    app.add_transform(AutoStructify)
-    app.connect("autodoc-process-docstring", remove_module_docstring)
+
+add_module_names = False
+autodoc_member_order = "bysource"
+
+
+# -- Doctest configuration ----------------------------------------
+
+import doctest
+
+doctest_default_flags = (0
+    | doctest.DONT_ACCEPT_TRUE_FOR_1
+    | doctest.ELLIPSIS
+    | doctest.IGNORE_EXCEPTION_DETAIL
+    | doctest.NORMALIZE_WHITESPACE
+)

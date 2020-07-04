@@ -1,35 +1,31 @@
 """
-This file is part of nucypher.
+ This file is part of nucypher.
 
-nucypher is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
 
-nucypher is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
 
-You should have received a copy of the GNU Affero General Public License
-along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
-
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import click
 import maya
+import os
 
-from nucypher.blockchain.eth.agents import StakingEscrowAgent, ContractAgency, PolicyManagerAgent
+from nucypher.blockchain.eth.agents import ContractAgency, PolicyManagerAgent, StakingEscrowAgent
 from nucypher.blockchain.eth.constants import (
-    STAKING_ESCROW_CONTRACT_NAME,
+    AVERAGE_BLOCK_TIME_IN_SECONDS,
     POLICY_MANAGER_CONTRACT_NAME,
-    AVERAGE_BLOCK_TIME_IN_SECONDS
+    STAKING_ESCROW_CONTRACT_NAME
 )
-from nucypher.blockchain.eth.interfaces import BlockchainInterfaceFactory
-from nucypher.blockchain.eth.registry import InMemoryContractRegistry, LocalContractRegistry
 from nucypher.blockchain.eth.utils import datetime_at_period
-from nucypher.characters.banners import NU_BANNER
-from nucypher.cli.actions import get_provider_process
 from nucypher.cli.config import group_general_config
 from nucypher.cli.options import (
     group_options,
@@ -43,8 +39,10 @@ from nucypher.cli.options import (
     option_registry_filepath,
     option_staking_address,
 )
-from nucypher.cli.painting import paint_contract_status, paint_stakers, paint_locked_tokens_status, \
-    paint_min_reward_range
+from nucypher.cli.painting.staking import paint_fee_rate_range
+from nucypher.cli.painting.status import paint_contract_status, paint_locked_tokens_status, paint_stakers
+from nucypher.cli.utils import connect_to_blockchain, get_registry, setup_emitter
+from nucypher.config.constants import NUCYPHER_ENVVAR_PROVIDER_URI
 
 
 class RegistryOptions:
@@ -59,66 +57,35 @@ class RegistryOptions:
         self.light = light
         self.network = network
 
-    def get_registry(self, emitter, debug):
-        try:
-            eth_node = None
-            if self.geth:
-                eth_node = get_provider_process()
-
-            # Note: For test compatibility.
-            if not BlockchainInterfaceFactory.is_interface_initialized(provider_uri=self.provider_uri):
-                BlockchainInterfaceFactory.initialize_interface(provider_uri=self.provider_uri,
-                                                                provider_process=eth_node,
-                                                                poa=self.poa,
-                                                                light=self.light,
-                                                                sync=False,
-                                                                emitter=emitter)
-
-            blockchain = BlockchainInterfaceFactory.get_interface(provider_uri=self.provider_uri)
-
-            emitter.echo(message="Reading Latest Chaindata...")
-            blockchain.connect()
-        except Exception as e:
-            if debug:
-                raise
-            click.secho(str(e), bold=True, fg='red')
-            raise click.Abort
-        if self.registry_filepath:
-            registry = LocalContractRegistry(filepath=self.registry_filepath)
-        else:
-            registry = InMemoryContractRegistry.from_latest_publication(network=self.network)
-
-        return registry
+    def setup(self, general_config) -> tuple:
+        emitter = setup_emitter(general_config)
+        registry = get_registry(network=self.network, registry_filepath=self.registry_filepath)
+        blockchain = connect_to_blockchain(emitter=emitter, provider_uri=self.provider_uri)
+        return emitter, registry, blockchain
 
 
 group_registry_options = group_options(
     RegistryOptions,
-    provider_uri=option_provider_uri(),
     geth=option_geth,
     poa=option_poa,
     light=option_light,
     registry_filepath=option_registry_filepath,
-    network=option_network,
-    )
+    network=option_network(),
+    provider_uri=option_provider_uri(default=os.environ.get(NUCYPHER_ENVVAR_PROVIDER_URI)),
+)
 
 
 @click.group()
 def status():
-    """
-    Echo a snapshot of live NuCypher Network metadata.
-    """
-    pass
+    """Echo a snapshot of live NuCypher Network metadata."""
 
 
 @status.command()
 @group_registry_options
 @group_general_config
 def network(general_config, registry_options):
-    """
-    Overall information of the NuCypher Network.
-    """
-    emitter = _setup_emitter(general_config)
-    registry = registry_options.get_registry(emitter, general_config.debug)
+    """Overall information of the NuCypher Network."""
+    emitter, registry, blockchain = registry_options.setup(general_config=general_config)
     paint_contract_status(registry, emitter=emitter)
 
 
@@ -127,15 +94,10 @@ def network(general_config, registry_options):
 @option_staking_address
 @group_general_config
 def stakers(general_config, registry_options, staking_address):
-    """
-    Show relevant information about stakers.
-    """
-    emitter = _setup_emitter(general_config)
-    registry = registry_options.get_registry(emitter, general_config.debug)
-
+    """Show relevant information about stakers."""
+    emitter, registry, blockchain = registry_options.setup(general_config=general_config)
     staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=registry)
     policy_agent = ContractAgency.get_agent(PolicyManagerAgent, registry=registry)
-
     stakers_list = [staking_address] if staking_address else staking_agent.get_stakers()
     paint_stakers(emitter=emitter, stakers=stakers_list, staking_agent=staking_agent, policy_agent=policy_agent)
 
@@ -145,11 +107,8 @@ def stakers(general_config, registry_options, staking_address):
 @click.option('--periods', help="Number of periods", type=click.INT, default=90)
 @group_general_config
 def locked_tokens(general_config, registry_options, periods):
-    """
-    Display a graph of the number of locked tokens over time.
-    """
-    emitter = _setup_emitter(general_config)
-    registry = registry_options.get_registry(emitter, general_config.debug)
+    """Display a graph of the number of locked tokens over time."""
+    emitter, registry, blockchain = registry_options.setup(general_config=general_config)
     staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=registry)
     paint_locked_tokens_status(emitter=emitter, agent=staking_agent, periods=periods)
 
@@ -164,13 +123,9 @@ def locked_tokens(general_config, registry_options, periods):
 # TODO: Add options for number of periods in the past (default current period), or range of blocks
 # TODO: Add way to input additional event filters? (e.g., staker, etc)
 def events(general_config, registry_options, contract_name, from_block, to_block, event_name):
-    """
-    Show events associated to NuCypher contracts
-    """
-    emitter = _setup_emitter(general_config)
-    registry = registry_options.get_registry(emitter, general_config.debug)
-    blockchain = BlockchainInterfaceFactory.get_interface(provider_uri=registry_options.provider_uri)
+    """Show events associated to NuCypher contracts."""
 
+    emitter, registry, blockchain = registry_options.setup(general_config=general_config)
     if not contract_name:
         if event_name:
             raise click.BadOptionUsage(option_name='--event-name', message='--event-name requires --contract-name')
@@ -181,7 +136,7 @@ def events(general_config, registry_options, contract_name, from_block, to_block
     if from_block is None:
         # Sketch of logic for getting the approximate block height of current period start,
         # so by default, this command only shows events of the current period
-        last_block = blockchain.client.w3.eth.blockNumber
+        last_block = blockchain.client.block_number
         staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=registry)
         current_period = staking_agent.get_current_period()
         current_period_start = datetime_at_period(period=current_period,
@@ -196,7 +151,6 @@ def events(general_config, registry_options, contract_name, from_block, to_block
         to_block = 'latest'
 
     # TODO: additional input validation for block numbers
-
     emitter.echo(f"Showing events from block {from_block} to {to_block}")
     for contract_name in contract_names:
         title = f" {contract_name} Events ".center(40, "-")
@@ -210,21 +164,11 @@ def events(general_config, registry_options, contract_name, from_block, to_block
                 emitter.echo(f"  - {event_record}")
 
 
-@status.command(name='reward-range')
+@status.command(name='fee-range')
 @group_registry_options
 @group_general_config
-def reward_range(general_config, registry_options):
-    """
-    Show information about the allowed range for min reward rate.
-    """
-    emitter = _setup_emitter(general_config)
-    registry = registry_options.get_registry(emitter, general_config.debug)
+def fee_range(general_config, registry_options):
+    """Provide information on the global fee range – the range into which the minimum fee rate must fall."""
+    emitter, registry, blockchain = registry_options.setup(general_config=general_config)
     policy_agent = ContractAgency.get_agent(PolicyManagerAgent, registry=registry)
-    paint_min_reward_range(emitter=emitter, policy_agent=policy_agent)
-
-
-def _setup_emitter(general_config):
-    emitter = general_config.emitter
-    emitter.banner(NU_BANNER)
-    return emitter
-
+    paint_fee_rate_range(emitter=emitter, policy_agent=policy_agent)

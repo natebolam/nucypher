@@ -1,4 +1,6 @@
-pragma solidity ^0.5.3;
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.5;
 
 import "contracts/lib/ReEncryptionValidator.sol";
 import "contracts/lib/SignatureVerifier.sol";
@@ -10,7 +12,7 @@ import "zeppelin/math/Math.sol";
 
 /**
 * @notice Supervises stakers' behavior and punishes when something's wrong.
-* @dev |v1.1.1|
+* @dev |v2.1.2|
 */
 contract Adjudicator is Upgradeable {
 
@@ -32,12 +34,13 @@ contract Adjudicator is Upgradeable {
     bytes32 constant RESERVED_CAPSULE_AND_CFRAG_BYTES = bytes32(0);
     address constant RESERVED_ADDRESS = address(0);
 
-    StakingEscrow public escrow;
-    SignatureVerifier.HashAlgorithm public hashAlgorithm;
-    uint256 public basePenalty;
-    uint256 public penaltyHistoryCoefficient;
-    uint256 public percentagePenaltyCoefficient;
-    uint256 public rewardCoefficient;
+    StakingEscrow public immutable escrow;
+    SignatureVerifier.HashAlgorithm public immutable hashAlgorithm;
+    uint256 public immutable basePenalty;
+    uint256 public immutable penaltyHistoryCoefficient;
+    uint256 public immutable percentagePenaltyCoefficient;
+    uint256 public immutable rewardCoefficient;
+
     mapping (address => uint256) public penaltyHistory;
     mapping (bytes32 => bool) public evaluatedCFrags;
 
@@ -156,7 +159,7 @@ contract Adjudicator is Upgradeable {
         address worker = SignatureVerifier.recover(
             SignatureVerifier.hashEIP191(stamp, byte(0x45)), // Currently, we use version E (0x45) of EIP191 signatures
             _workerIdentityEvidence);
-        address staker = escrow.getStakerFromWorker(worker);
+        address staker = escrow.stakerFromWorker(worker);
         require(staker != address(0), "Worker must be related to a staker");
 
         // 5. Check that staker can be slashed
@@ -187,35 +190,22 @@ contract Adjudicator is Upgradeable {
     }
 
     /// @dev the `onlyWhileUpgrading` modifier works through a call to the parent `verifyState`
-    function verifyState(address _testTarget) public {
+    function verifyState(address _testTarget) public override virtual {
         super.verifyState(_testTarget);
-        require(address(delegateGet(_testTarget, "escrow()")) == address(escrow));
-        require(SignatureVerifier.HashAlgorithm(delegateGet(_testTarget, "hashAlgorithm()")) == hashAlgorithm);
-        require(delegateGet(_testTarget, "basePenalty()") == basePenalty);
-        require(delegateGet(_testTarget, "penaltyHistoryCoefficient()") == penaltyHistoryCoefficient);
-        require(delegateGet(_testTarget, "percentagePenaltyCoefficient()") == percentagePenaltyCoefficient);
-        require(delegateGet(_testTarget, "rewardCoefficient()") == rewardCoefficient);
-        require(delegateGet(_testTarget, "penaltyHistory(address)", bytes32(bytes20(RESERVED_ADDRESS))) ==
-            penaltyHistory[RESERVED_ADDRESS]);
         bytes32 evaluationCFragHash = SignatureVerifier.hash(
-            abi.encodePacked(RESERVED_CAPSULE_AND_CFRAG_BYTES), hashAlgorithm);
-        require(delegateGet(_testTarget, "evaluatedCFrags(bytes32)", evaluationCFragHash) ==
+            abi.encodePacked(RESERVED_CAPSULE_AND_CFRAG_BYTES), SignatureVerifier.HashAlgorithm.SHA256);
+        require(delegateGet(_testTarget, this.evaluatedCFrags.selector, evaluationCFragHash) ==
             (evaluatedCFrags[evaluationCFragHash] ? 1 : 0));
+        require(delegateGet(_testTarget, this.penaltyHistory.selector, bytes32(bytes20(RESERVED_ADDRESS))) ==
+            penaltyHistory[RESERVED_ADDRESS]);
     }
 
     /// @dev the `onlyWhileUpgrading` modifier works through a call to the parent `finishUpgrade`
-    function finishUpgrade(address _target) public {
+    function finishUpgrade(address _target) public override virtual {
         super.finishUpgrade(_target);
-        Adjudicator targetContract = Adjudicator(_target);
-        escrow = targetContract.escrow();
-        hashAlgorithm = targetContract.hashAlgorithm();
-        basePenalty = targetContract.basePenalty();
-        penaltyHistoryCoefficient = targetContract.penaltyHistoryCoefficient();
-        percentagePenaltyCoefficient = targetContract.percentagePenaltyCoefficient();
-        rewardCoefficient = targetContract.rewardCoefficient();
         // preparation for the verifyState method
         bytes32 evaluationCFragHash = SignatureVerifier.hash(
-            abi.encodePacked(RESERVED_CAPSULE_AND_CFRAG_BYTES), hashAlgorithm);
+            abi.encodePacked(RESERVED_CAPSULE_AND_CFRAG_BYTES), SignatureVerifier.HashAlgorithm.SHA256);
         evaluatedCFrags[evaluationCFragHash] = true;
         penaltyHistory[RESERVED_ADDRESS] = 123;
     }

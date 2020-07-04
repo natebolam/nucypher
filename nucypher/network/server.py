@@ -17,32 +17,31 @@ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 
 import binascii
 import os
-from typing import Tuple
-
 from bytestring_splitter import BytestringSplitter
 from constant_sorrow import constants
-from constant_sorrow.constants import FLEET_STATES_MATCH, NO_KNOWN_NODES, NO_BLOCKCHAIN_CONNECTION
-from flask import Flask, Response, jsonify
-from flask import request
+from constant_sorrow.constants import FLEET_STATES_MATCH, NO_BLOCKCHAIN_CONNECTION, NO_KNOWN_NODES
+from flask import Flask, Response, jsonify, request
 from hendrix.experience import crosstown_traffic
 from jinja2 import Template, TemplateError
 from twisted.logger import Logger
+from typing import Tuple
+from umbral.keys import UmbralPublicKey
+from umbral.kfrags import KFrag
 from web3.exceptions import TimeExhausted
 
 import nucypher
+from nucypher.config.constants import MAX_UPLOAD_CONTENT_LENGTH
 from nucypher.config.storages import ForgetfulNodeStorage
 from nucypher.crypto.kits import UmbralMessageKit
 from nucypher.crypto.powers import KeyPairBasedPower, PowerUpError
 from nucypher.crypto.signing import InvalidSignature
 from nucypher.crypto.utils import canonical_address_from_umbral_key
-from nucypher.keystore.keypairs import HostingKeypair
-from nucypher.keystore.keystore import NotFound
-from nucypher.keystore.threading import ThreadedSession
+from nucypher.datastore.datastore import NotFound
+from nucypher.datastore.keypairs import HostingKeypair
+from nucypher.datastore.threading import ThreadedSession
 from nucypher.network import LEARNING_LOOP_VERSION
 from nucypher.network.exceptions import NodeSeemsToBeDown
 from nucypher.network.protocols import InterfaceInfo
-from umbral.keys import UmbralPublicKey
-from umbral.kfrags import KFrag
 
 HERE = BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 TEMPLATES_DIR = os.path.join(HERE, "templates")
@@ -86,8 +85,8 @@ def make_rest_app(
 
     forgetful_node_storage = ForgetfulNodeStorage(federated_only=this_node.federated_only)
 
-    from nucypher.keystore import keystore
-    from nucypher.keystore.db import Base
+    from nucypher.datastore import datastore
+    from nucypher.datastore.db import Base
     from sqlalchemy.engine import create_engine
 
     log.info("Starting datastore {}".format(db_filepath))
@@ -101,7 +100,7 @@ def make_rest_app(
     engine = create_engine(db_uri)
 
     Base.metadata.create_all(engine)
-    datastore = keystore.KeyStore(engine)
+    datastore = datastore.Datastore(engine)
     db_engine = engine
 
     from nucypher.characters.lawful import Alice, Ursula
@@ -109,6 +108,7 @@ def make_rest_app(
     _node_class = Ursula
 
     rest_app = Flask("ursula-service")
+    rest_app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_CONTENT_LENGTH
 
     @rest_app.route("/public_information")
     def public_information():
@@ -120,6 +120,45 @@ def make_rest_app(
             mimetype='application/octet-stream')
 
         return response
+
+    @rest_app.route("/ping", methods=['POST'])
+    def ping():
+        """
+        Asks this node: "Can you access my public information endpoint"?
+        """
+
+        try:
+            requesting_ursula = Ursula.from_bytes(request.data, registry=this_node.registry)
+            requesting_ursula.mature()
+        except ValueError:  # (ValueError)
+            return Response({'error': 'Invalid Ursula'}, status=400)
+        else:
+            initiator_address, initiator_port = tuple(requesting_ursula.rest_interface)
+
+        # Compare requester and posted Ursula information
+        request_address = request.environ['REMOTE_ADDR']
+        if request_address != initiator_address:
+            return Response({'error': 'Suspicious origin address'}, status=400)
+
+        #
+        # Make a Sandwich
+        #
+
+        try:
+            # Fetch and store initiator's teacher certificate.
+            certificate = this_node.network_middleware.get_certificate(host=initiator_address, port=initiator_port)
+            certificate_filepath = this_node.node_storage.store_node_certificate(certificate=certificate)
+            requesting_ursula_bytes = this_node.network_middleware.client.node_information(host=initiator_address,
+                                                                                           port=initiator_port,
+                                                                                           certificate_filepath=certificate_filepath)
+        except NodeSeemsToBeDown:
+            return Response({'error': 'Unreachable node'}, status=400)  # ... toasted
+
+        # Compare the results of the outer POST with the inner GET... yum
+        if requesting_ursula_bytes == request.data:
+            return Response(status=200)
+        else:
+            return Response({'error': 'Suspicious node'}, status=400)
 
     @rest_app.route('/node_metadata', methods=["GET"])
     def all_known_nodes():
@@ -160,8 +199,7 @@ def make_rest_app(
 
                 try:
                     node.verify_node(this_node.network_middleware.client,
-                                     registry=this_node.registry,
-                                     )
+                                     registry=this_node.registry)
 
                 # Suspicion
                 except node.SuspiciousActivity as e:
@@ -203,7 +241,7 @@ def make_rest_app(
         with ThreadedSession(db_engine) as session:
             new_policy_arrangement = datastore.add_policy_arrangement(
                 arrangement.expiration.datetime(),
-                id=arrangement.id.hex().encode(),
+                arrangement_id=arrangement.id.hex().encode(),
                 alice_verifying_key=arrangement.alice.stamp,
                 session=session,
             )

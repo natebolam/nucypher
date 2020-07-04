@@ -1,40 +1,35 @@
-pragma solidity ^0.5.3;
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+pragma solidity ^0.6.5;
 
 
 import "zeppelin/ownership/Ownable.sol";
 import "zeppelin/utils/Address.sol";
+import "zeppelin/token/ERC20/SafeERC20.sol";
+import "contracts/staking_contracts/StakingInterface.sol";
 
 
 /**
 * @notice Router for accessing interface contract
 */
 contract StakingInterfaceRouter is Ownable {
-    using Address for address;
-
-    address public target;
-    bytes32 public secretHash;
+    BaseStakingInterface public target;
 
     /**
     * @param _target Address of the interface contract
-    * @param _newSecretHash Secret hash (keccak256)
     */
-    constructor(address _target, bytes32 _newSecretHash) public {
-        require(_target.isContract());
+    constructor(BaseStakingInterface _target) public {
+        require(address(_target.token()) != address(0));
         target = _target;
-        secretHash = _newSecretHash;
     }
 
     /**
     * @notice Upgrade interface
     * @param _target New contract address
-    * @param _secret Secret for proof of contract owning
-    * @param _newSecretHash New secret hash (keccak256)
     */
-    function upgrade(address _target, bytes calldata _secret, bytes32 _newSecretHash) external onlyOwner {
-        require(_target.isContract());
-        require(keccak256(_secret) == secretHash && _newSecretHash != secretHash);
+    function upgrade(BaseStakingInterface _target) external onlyOwner {
+        require(address(_target.token()) != address(0));
         target = _target;
-        secretHash = _newSecretHash;
     }
 
 }
@@ -43,32 +38,49 @@ contract StakingInterfaceRouter is Ownable {
 /**
 * @notice Base class for any staking contract
 * @dev Implement `isFallbackAllowed()` or override fallback function
+* Implement `withdrawTokens(uint256)` and `withdrawETH()` functions
 */
-contract AbstractStakingContract {
+abstract contract AbstractStakingContract {
     using Address for address;
+    using Address for address payable;
+    using SafeERC20 for NuCypherToken;
 
-    StakingInterfaceRouter public router;
+    StakingInterfaceRouter public immutable router;
+    NuCypherToken public immutable token;
 
     /**
     * @param _router Interface router contract address
     */
     constructor(StakingInterfaceRouter _router) public {
-        // check that the input address is contract
-        require(_router.target().isContract());
         router = _router;
+        NuCypherToken localToken = _router.target().token();
+        require(address(localToken) != address(0));
+        token = localToken;
     }
 
     /**
     * @dev Checks permission for calling fallback function
     */
-    function isFallbackAllowed() public returns (bool);
+    function isFallbackAllowed() public virtual returns (bool);
+
+    /**
+    * @dev Withdraw tokens from staking contract
+    */
+    function withdrawTokens(uint256 _value) public virtual;
+
+    /**
+    * @dev Withdraw ETH from staking contract
+    */
+    function withdrawETH() public virtual;
+
+    receive() external payable {}
 
     /**
     * @dev Function sends all requests to the target contract
     */
-    function () external payable {
+    fallback() external payable {
         require(isFallbackAllowed());
-        address target = router.target();
+        address target = address(router.target());
         require(target.isContract());
         // execute requested function from target contract
         (bool callSuccess,) = target.delegatecall(msg.data);
@@ -77,8 +89,8 @@ contract AbstractStakingContract {
             // we can use the second return value from `delegatecall` (bytes memory)
             // but it will consume a little more gas
             assembly {
-                returndatacopy(0x0, 0x0, returndatasize)
-                return(0x0, returndatasize)
+                returndatacopy(0x0, 0x0, returndatasize())
+                return(0x0, returndatasize())
             }
         } else {
             revert();

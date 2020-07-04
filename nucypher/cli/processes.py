@@ -1,33 +1,33 @@
+
 """
-This file is part of nucypher.
+ This file is part of nucypher.
 
-nucypher is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
 
-nucypher is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
 
-You should have received a copy of the GNU Affero General Public License
-along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
-import json
-import os
+
+
 from collections import deque
-from json import JSONDecodeError
 
-import click
 import maya
+import os
 from twisted.internet import reactor
 from twisted.internet.protocol import connectionDone
 from twisted.internet.stdio import StandardIO
 from twisted.logger import Logger
 from twisted.protocols.basic import LineReceiver
 
-from nucypher.cli.painting import build_fleet_state_status
+from nucypher.blockchain.eth.clients import NuCypherGethGoerliProcess
 
 
 class UrsulaCommandProtocol(LineReceiver):
@@ -59,7 +59,7 @@ class UrsulaCommandProtocol(LineReceiver):
             # 'stakes': self.paintStakes,  # TODO
 
             # Blockchain Control
-            'confirm_activity': self.confirm_activity,
+            'commit_next': self.commit_to_next_period,  # hidden
 
             # Learning Control
             'cycle_teacher': self.cycle_teacher,
@@ -81,7 +81,7 @@ class UrsulaCommandProtocol(LineReceiver):
         """
         self.emitter.echo("\nUrsula Command Help\n===================\n")
         for command, func in self.__commands.items():
-            if '?' not in command:
+            if command not in ('?', 'commit_next'):
                 try:
                     self.emitter.echo(f'{command}\n{"-"*len(command)}\n{func.__doc__.lstrip()}')
                 except AttributeError:
@@ -92,15 +92,15 @@ class UrsulaCommandProtocol(LineReceiver):
         """
         Display a list of all known nucypher peers.
         """
-        from nucypher.cli.painting import paint_known_nodes
+        from nucypher.cli.painting.nodes import paint_known_nodes
         paint_known_nodes(emitter=self.emitter, ursula=self.ursula)
 
     def paintStakes(self):
         """
         Display a list of all active stakes.
         """
-        from nucypher.cli.painting import paint_stakes
         if self.ursula.stakes:
+            from nucypher.cli.painting.staking import paint_stakes
             paint_stakes(self.emitter, stakes=self.ursula.stakes)
         else:
             self.emitter.echo("No active stakes.")
@@ -109,25 +109,18 @@ class UrsulaCommandProtocol(LineReceiver):
         """
         Display the current status of the attached Ursula node.
         """
-        from nucypher.cli.painting import paint_node_status
+        from nucypher.cli.painting.nodes import paint_node_status
         paint_node_status(emitter=self.emitter, ursula=self.ursula, start_time=self.start_time)
 
     def paintFleetState(self):
         """
         Display information about the network-wide fleet state as the attached Ursula node sees it.
         """
+        from nucypher.cli.painting.nodes import build_fleet_state_status
         line = '{}'.format(build_fleet_state_status(ursula=self.ursula))
         self.emitter.echo(line)
 
     def connectionMade(self):
-
-        message = 'Attached {}@{}'.format(
-                   self.ursula.checksum_address,
-                   self.ursula.rest_url())
-
-        self.emitter.echo(message, color='green')
-        self.emitter.echo('{} | {}'.format(self.ursula.nickname_icon, self.ursula.nickname), color='blue', bold=True)
-
         self.emitter.echo("\nType 'help' or '?' for help")
         self.transport.write(self.prompt)
 
@@ -135,9 +128,7 @@ class UrsulaCommandProtocol(LineReceiver):
         self.ursula.stop_learning_loop(reason=reason)
 
     def lineReceived(self, line):
-        """
-        Ursula Console REPL
-        """
+        """Ursula Console REPL"""
 
         # Read
         raw_line = line.decode(encoding=self.encoding)
@@ -150,7 +141,8 @@ class UrsulaCommandProtocol(LineReceiver):
         # Print
         except KeyError:
             if line:  # allow for empty string
-                self.emitter.echo("Invalid input. Options are {}".format(', '.join(self.__commands.keys())))
+                self.emitter.echo("Invalid input")
+                self.__commands["?"]()
 
         else:
             self.__history.append(raw_line)
@@ -176,11 +168,11 @@ class UrsulaCommandProtocol(LineReceiver):
         """
         return self.ursula.stop_learning_loop()
 
-    def confirm_activity(self):
+    def commit_to_next_period(self):
         """
-        manually confirm activity for this period
+        manually make a commitment to the next period
         """
-        return self.ursula.confirm_activity()
+        return self.ursula.commit_to_next_period()
 
     def stop(self):
         """
@@ -240,3 +232,12 @@ class JSONRPCLineReceiver(LineReceiver):
         line = line.strip(self.delimiter)
         if line:
             self.rpc_controller.handle_request(control_request=line)
+
+
+def get_geth_provider_process(start_now: bool = False) -> NuCypherGethGoerliProcess:
+    """Stage integrated ethereum node process"""
+    # TODO: Support domains and non-geth clients
+    process = NuCypherGethGoerliProcess()
+    if start_now:
+        process.start()
+    return process

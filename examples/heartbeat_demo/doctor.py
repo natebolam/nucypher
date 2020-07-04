@@ -1,23 +1,38 @@
+"""
+ This file is part of nucypher.
+
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
 import json
-import os
-import sys
-import shutil
-import msgpack
-import maya
 import traceback
 from timeit import default_timer as timer
 
-from nucypher.characters.lawful import Bob, Ursula, Enrico
-from nucypher.crypto.kits import UmbralMessageKit
-from nucypher.crypto.powers import DecryptingPower, SigningPower
-from nucypher.keystore.keypairs import DecryptingKeypair, SigningKeypair
-from nucypher.network.middleware import RestMiddleware
-
+import maya
+import msgpack
+import os
+import shutil
+import sys
 from umbral.keys import UmbralPublicKey
 
+from nucypher.characters.lawful import Bob, Enrico, Ursula
+from nucypher.config.constants import TEMPORARY_DOMAIN
+from nucypher.crypto.kits import UmbralMessageKit
+from nucypher.crypto.powers import DecryptingPower, SigningPower
+from nucypher.datastore.keypairs import DecryptingKeypair, SigningKeypair
+from nucypher.network.middleware import RestMiddleware
 from nucypher.utilities.logging import GlobalLoggerSettings
-from nucypher.utilities.sandbox.constants import TEMPORARY_DOMAIN
-
 
 GlobalLoggerSettings.start_console_logging()
 
@@ -97,8 +112,8 @@ for message_kit in message_kits:
     try:
         start = timer()
         retrieved_plaintexts = doctor.retrieve(
+            message_kit,
             label=label,
-            message_kit=message_kit,
             enrico=data_source,
             alice_verifying_key=alices_sig_pubkey
         )

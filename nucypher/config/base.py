@@ -1,10 +1,28 @@
+"""
+ This file is part of nucypher.
+
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
 import json
+
 import os
 from abc import ABC, abstractmethod
-
 from constant_sorrow.constants import (
     UNKNOWN_VERSION
 )
+from typing import Union
 
 from nucypher.config import constants
 
@@ -16,40 +34,37 @@ class BaseConfiguration(ABC):
     and restoring a subclass instance from the written JSON file by passing the deserialized
     values to the subclass's constructor.
 
-    Implementation
-    ==============
+    Implementation:
 
-    `_NAME` and `def static_payload` are required for subclasses, for example:
+    `NAME` and `def static_payload` are required for subclasses, for example:
 
+    .. code::
 
-        ```
         class MyItem(BaseConfiguration):
             _NAME = 'my-item'
 
-        ```
-        AND
+    AND
 
-        ```
+    .. code::
+
         def static_payload(self) -> dict:
             payload = dict(**super().static_payload(), key=value)
             return payload
-        ```
 
-        OR
+    OR
 
-        ```
+    .. code::
+
         def static_payload(self) -> dict:
             subclass_payload = {'key': 'value'}
             payload = {**super().static_payload(), **subclass_payload}
             return payload
-        ```
 
     Filepath Generation
-    ===================
 
     Default behavior *avoids* overwriting an existing configuration file:
 
-    - The name of the JSON file to write/read from is determined by `_NAME`.
+    - The name of the JSON file to write/read from is determined by `NAME`.
       When calling `to_configuration_file`.
 
     - If the default path (i.e. `my-item.json`) already  exists and, optionally,
@@ -60,15 +75,14 @@ class BaseConfiguration(ABC):
     If the subclass implementation has a global unique identifier, an additional method override
     to `to_configuration_file` will automate the renaming process.
 
-        ```
+    .. code::
+
         def to_configuration_file(*args, **kwargs) -> str:
             filepath = super().to_configuration_file(modifier=<MODIFIER>, *args, **kwargs)
             return filepath
-        ```
-
     """
 
-    _NAME = NotImplemented
+    NAME = NotImplemented
     _CONFIG_FILE_EXTENSION = 'json'
 
     INDENTATION = 2
@@ -93,8 +107,8 @@ class BaseConfiguration(ABC):
                  filepath: str = None,
                  *args, **kwargs):
 
-        if self._NAME is NotImplemented:
-            error = f'_NAME must be implemented on BaseConfiguration subclass {self.__class__.__name__}'
+        if self.NAME is NotImplemented:
+            error = f'NAME must be implemented on BaseConfiguration subclass {self.__class__.__name__}'
             raise TypeError(error)
 
         self.config_root = config_root or self.DEFAULT_CONFIG_ROOT
@@ -103,9 +117,6 @@ class BaseConfiguration(ABC):
         self.filepath = filepath
 
         super().__init__()
-
-    def __eq__(self, other):
-        return bool(self.static_payload() == other.static_payload())
 
     @abstractmethod
     def static_payload(self) -> dict:
@@ -140,7 +151,7 @@ class BaseConfiguration(ABC):
         :param modifier: String to modify default filename with.
         :return: The generated filepath string.
         """
-        name = cls._NAME.lower()
+        name = cls.NAME.lower()
         if modifier:
             name += f'-{modifier}'
         filename = f'{name}.{cls._CONFIG_FILE_EXTENSION.lower()}'
@@ -198,6 +209,15 @@ class BaseConfiguration(ABC):
             except FileNotFoundError:
                 os.makedirs(self.config_root, mode=0o755)
 
+    @classmethod
+    def peek(cls, filepath: str, field: str) -> Union[str, None]:
+        payload = cls._read_configuration_file(filepath=filepath)
+        try:
+            result = payload[field]
+        except KeyError:
+            raise cls.ConfigurationError(f"Cannot peek; No such configuration field '{field}', options are {list(payload.keys())}")
+        return result
+
     def to_configuration_file(self, filepath: str = None, modifier: str = None, override: bool = False) -> str:
         filepath = self.generate_filepath(filepath=filepath, modifier=modifier, override=override)
         self._ensure_config_root_exists()
@@ -221,7 +241,7 @@ class BaseConfiguration(ABC):
 
     def _write_configuration_file(self, filepath: str, override: bool = False) -> str:
         """Writes to `filepath` and returns the written filepath.  Raises `FileExistsError` if the file exists."""
-        if os.path.exists(filepath) and not override:
+        if os.path.exists(str(filepath)) and not override:
             raise FileExistsError(f"{filepath} exists and no filename modifier supplied.")
         with open(filepath, 'w') as file:
             file.write(self.serialize())
@@ -244,7 +264,7 @@ class BaseConfiguration(ABC):
                                  f"Expected version {cls.VERSION}; Got version {version}")
         return deserialized_payload
 
-    def update(self, filepath: str = None, modifier: str = None, **updates):
+    def update(self, filepath: str = None, modifier: str = None, **updates) -> None:
         for field, value in updates.items():
             try:
                 getattr(self, field)

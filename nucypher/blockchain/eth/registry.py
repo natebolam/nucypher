@@ -14,23 +14,23 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
-import hashlib
 import json
+from json import JSONDecodeError
+from os.path import abspath, dirname
+
+import hashlib
 import os
+import requests
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
-from json import JSONDecodeError
-from os.path import dirname, abspath
-from typing import Union, Iterator, List, Dict, Type, Tuple
-
-import requests
-from constant_sorrow.constants import REGISTRY_COMMITTED, NO_REGISTRY_SOURCE
+from constant_sorrow.constants import NO_REGISTRY_SOURCE, REGISTRY_COMMITTED
 from twisted.logger import Logger
+from typing import Dict, Iterator, List, Tuple, Type, Union
 
+from nucypher.blockchain.eth.constants import PREALLOCATION_ESCROW_CONTRACT_NAME
 from nucypher.blockchain.eth.networks import NetworksInventory
 from nucypher.config.constants import DEFAULT_CONFIG_ROOT
-from nucypher.blockchain.eth.constants import PREALLOCATION_ESCROW_CONTRACT_NAME
 
 
 class CanonicalRegistrySource(ABC):
@@ -41,9 +41,9 @@ class CanonicalRegistrySource(ABC):
     is_primary = NotImplementedError
 
     def __init__(self, network: str, registry_name: str, *args, **kwargs):
-        if network not in NetworksInventory.networks:
+        if network not in NetworksInventory.NETWORKS:
             raise ValueError(f"{self.__class__.__name__} not available for network '{network}'. "
-                             f"Valid options are: {list(NetworksInventory.networks)}")
+                             f"Valid options are: {list(NetworksInventory.NETWORKS)}")
         self.network = network
         self.registry_name = registry_name
 
@@ -96,11 +96,11 @@ class GithubRegistrySource(CanonicalRegistrySource):
         return registry_data
 
 
-class InPackageRegistrySource(CanonicalRegistrySource):
+class EmbeddedRegistrySource(CanonicalRegistrySource):
     _HERE = os.path.abspath(os.path.dirname(__file__))
     _REGISTRY_DIR = os.path.join(_HERE, "contract_registry")
 
-    name = "In-Package Registry Source"
+    name = "Embedded Registry Source"
     is_primary = False
 
     def get_publication_endpoint(self) -> str:
@@ -130,7 +130,7 @@ class RegistrySourceManager:
     )  # type: Tuple[Type[CanonicalRegistrySource]]
 
     _LOCAL_SOURCES = (
-        InPackageRegistrySource,
+        EmbeddedRegistrySource,
     )  # type: Tuple[Type[CanonicalRegistrySource]]
 
     _FALLBACK_CHAIN = _REMOTE_SOURCES + _LOCAL_SOURCES
@@ -201,6 +201,8 @@ class BaseContractRegistry(ABC):
     # Registry
     REGISTRY_NAME = 'contract_registry.json'  # TODO: #1511 Save registry with ID-time-based filename
     DEVELOPMENT_REGISTRY_NAME = 'dev_contract_registry.json'
+
+    NO_REGISTRY_SOURCE.bool_value(False)
 
     class RegistryError(Exception):
         pass
@@ -362,7 +364,7 @@ class LocalContractRegistry(BaseContractRegistry):
 
     @property
     def filepath(self) -> str:
-        return self.__filepath
+        return str(self.__filepath)
 
     def _swap_registry(self, filepath: str) -> bool:
         self.__filepath = filepath
@@ -378,7 +380,7 @@ class LocalContractRegistry(BaseContractRegistry):
         """
         try:
             with open(self.filepath, 'r') as registry_file:
-                self.log.debug("Reading from registrar: filepath {}".format(self.filepath))
+                self.log.debug("Reading from registry: filepath {}".format(self.filepath))
                 registry_file.seek(0)
                 file_data = registry_file.read()
                 if file_data:

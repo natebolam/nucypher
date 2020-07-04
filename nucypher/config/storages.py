@@ -15,20 +15,20 @@ You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import binascii
-import os
 import sqlite3
-import tempfile
-from abc import abstractmethod, ABC
-from typing import Callable, Tuple, Union, Set, Any
 
 import OpenSSL
+import binascii
+import os
+import tempfile
+from abc import ABC, abstractmethod
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509 import Certificate, NameOID
 from eth_utils import is_checksum_address
 from twisted.logger import Logger
+from typing import Any, Callable, Set, Tuple, Union
 
 from nucypher.blockchain.eth.decorators import validate_checksum_address
 from nucypher.blockchain.eth.registry import BaseContractRegistry
@@ -49,6 +49,9 @@ class NodeStorage(ABC):
 
     class UnknownNode(NodeStorageError):
         pass
+
+    class InvalidNodeCertificate(RuntimeError):
+        """Raised when a TLS certificate is not a valid Teacher certificate."""
 
     def __init__(self,
                  federated_only: bool,  # TODO# 466
@@ -79,6 +82,12 @@ class NodeStorage(ABC):
     def __iter__(self):
         return self.all(federated_only=self.federated_only)
 
+    @property
+    @abstractmethod
+    def source(self) -> str:
+        """Human readable source string"""
+        return NotImplemented
+
     def _read_common_name(self, certificate: Certificate):
         x509 = OpenSSL.crypto.X509.from_cryptography(certificate)
         subject_components = x509.get_subject().get_components()
@@ -99,17 +108,22 @@ class NodeStorage(ABC):
         if not host:
             host = common_name_on_certificate
 
-        pseudonym = certificate.subject.get_attributes_for_oid(NameOID.PSEUDONYM)[0]
-        checksum_address = pseudonym.value
+        try:
+            pseudonym = certificate.subject.get_attributes_for_oid(NameOID.PSEUDONYM)[0]
+        except IndexError:
+            raise self.InvalidNodeCertificate(f"Missing checksum address on certificate for host '{host}'. "
+                                              f"Does this certificate belong to an Ursula?")
+        else:
+            checksum_address = pseudonym.value
 
-        if not is_checksum_address(checksum_address):  # TODO: more?
-            raise RuntimeError("Invalid certificate checksum address encountered: {}".format(checksum_address))
+        if not is_checksum_address(checksum_address):
+            raise self.InvalidNodeCertificate("Invalid certificate wallet address encountered: {}".format(checksum_address))
 
         # Validate
         # TODO: It's better for us to have checked this a while ago so that this situation is impossible.  #443
         if host and (host != common_name_on_certificate):
-            raise ValueError(
-                f"You passed a hostname ('{host}') that does not match the certificate's common name.")
+            raise ValueError(f"You passed a hostname ('{host}') that does not match the certificate's common name.")
+
         certificate_filepath = self.generate_certificate_filepath(checksum_address=checksum_address)
         certificate_already_exists = os.path.isfile(certificate_filepath)
         if force is False and certificate_already_exists:
@@ -187,9 +201,10 @@ class ForgetfulNodeStorage(NodeStorage):
         self.__temporary_certificates = list()
         self._temp_certificates_dir = tempfile.mkdtemp(prefix='nucypher-temp-certs-', dir=parent_dir)
 
-    # TODO: Pending fix for 1554.
-    # def __del__(self):
-    #     shutil.rmtree(self._temp_certificates_dir, ignore_errors=True)
+    @property
+    def source(self) -> str:
+        """Human readable source string"""
+        return self._name
 
     def all(self, federated_only: bool, certificates_only: bool = False) -> set:
         return set(self.__metadata.values() if not certificates_only else self.__certificates.values())
@@ -375,6 +390,11 @@ class LocalFileBasedNodeStorage(NodeStorage):
         self.metadata_dir = metadata_dir
         self.certificates_dir = certificates_dir
         self._cache_storage_filepaths(config_root=config_root)
+
+    @property
+    def source(self) -> str:
+        """Human readable source string"""
+        return self.root_dir
 
     @staticmethod
     def _generate_storage_filepaths(config_root: str = None,

@@ -1,12 +1,42 @@
-import functools
-from datetime import datetime
+"""
+ This file is part of nucypher.
 
-from twisted.logger import Logger
-from typing import Callable
-import inspect
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
 import eth_utils
+import functools
+import inspect
+from constant_sorrow.constants import (
+    CONTRACT_ATTRIBUTE,
+    CONTRACT_CALL,
+    TRANSACTION,
+    UNKNOWN_CONTRACT_INTERFACE
+)
+from datetime import datetime
+from twisted.logger import Logger
+from typing import Callable, Optional, Union
 
-from nucypher.crypto.api import keccak_digest
+from nucypher.types import ContractReturnValue
+
+ContractInterfaces = Union[
+    CONTRACT_CALL,
+    TRANSACTION,
+    CONTRACT_ATTRIBUTE,
+    UNKNOWN_CONTRACT_INTERFACE
+]
+
 
 __VERIFIED_ADDRESSES = set()
 
@@ -30,6 +60,7 @@ def validate_checksum_address(func: Callable) -> Callable:
     """
 
     parameter_name_suffix = '_address'
+    aliases = ('account', 'address')
     log = Logger('EIP-55-validator')
 
     @functools.wraps(func)
@@ -38,7 +69,9 @@ def validate_checksum_address(func: Callable) -> Callable:
         # Check for the presence of checksum addresses in this call
         params = inspect.getcallargs(func, *args, **kwargs)
         addresses_as_parameters = (parameter_name for parameter_name in params
-                                   if parameter_name.endswith(parameter_name_suffix))
+                                   if parameter_name.endswith(parameter_name_suffix)
+                                   or parameter_name in aliases)
+
         for parameter_name in addresses_as_parameters:
             checksum_address = params[parameter_name]
 
@@ -73,41 +106,9 @@ def validate_checksum_address(func: Callable) -> Callable:
     return wrapped
 
 
-def validate_secret(func: Callable) -> Callable:
-    """Decorator to enforce correct upgrade/rollback secret in upgradeable contracts"""
-
-    parameter_name = 'existing_secret_plaintext'
-    log = Logger('Upgrade-Secret-Validator')
-
-    @functools.wraps(func)
-    def wrapped(self, *args, **kwargs):
-
-        # Check for the presence of a plaintext secret in this call
-        params = inspect.getcallargs(func, self, *args, **kwargs)
-        try:
-            secret = params[parameter_name]
-        except KeyError:  # No plaintext secret present in this call
-            found_params = ', '.join("'{}'".format(p) for p in params)
-            message = f"Incorrect use of decorator: '{parameter_name}' not found. " \
-                      f"Found parameters are: {found_params}"
-            log.debug(message)
-            raise TypeError(message)
-
-        # Validate
-        secret_hash = self.contract.functions.secretHash().call()
-        is_valid_secret = secret_hash == keccak_digest(secret)
-
-        if is_valid_secret:  # Yay!  \ (•◡•) /
-            return func(self, *args, **kwargs)
-        else:
-            message = f"The secret provided for upgrade/rollback {self.contract_name} is not valid."
-            raise self.ContractDeploymentError(message)
-
-    return wrapped
-
-
-def only_me(func):
+def only_me(func: Callable) -> Callable:
     """Decorator to enforce invocation of permissioned actor methods"""
+    @functools.wraps(func)
     def wrapped(actor=None, *args, **kwargs):
         if not actor.is_me:
             raise actor.StakerError("You are not {}".format(actor.__class.__.__name__))
@@ -115,10 +116,40 @@ def only_me(func):
     return wrapped
 
 
-def save_receipt(actor_method):
+def save_receipt(actor_method) -> Callable:
     """Decorator to save the receipts of transmitted transactions from actor methods"""
-    def wrapped(self, *args, **kwargs):
+    @functools.wraps(actor_method)
+    def wrapped(self, *args, **kwargs) -> dict:
         receipt = actor_method(self, *args, **kwargs)
         self._saved_receipts.append((datetime.utcnow(), receipt))
         return receipt
     return wrapped
+
+
+#
+# Contract Function Handling
+#
+
+
+# TODO: Auto disable collection in prod (detect test package?)
+COLLECT_CONTRACT_API = True
+
+
+def contract_api(interface: Optional[ContractInterfaces] = UNKNOWN_CONTRACT_INTERFACE) -> Callable:
+    """Decorator factory for contract API markers"""
+
+    def decorator(agent_method: Callable) -> Callable[..., ContractReturnValue]:
+        """
+        Marks an agent method as containing contract interactions (transaction or call)
+        and validates outbound checksum addresses for EIP-55 compliance.
+
+        If `COLLECT_CONTRACT_API` is True when running tests,
+        all marked methods will be collected for automatic mocking
+        and integration with pytest fixtures.
+        """
+        if COLLECT_CONTRACT_API:
+            agent_method.contract_api = interface
+        agent_method = validate_checksum_address(func=agent_method)
+        return agent_method
+
+    return decorator

@@ -15,76 +15,74 @@ You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-
-import csv
 import json
-import os
-import time
-from decimal import Decimal
-from pathlib import Path
-from typing import Tuple, List, Dict, Union
+import traceback
 
 import click
+import csv
 import maya
-from constant_sorrow.constants import (
-    WORKER_NOT_RUNNING,
-    NO_WORKER_ASSIGNED,
-    BARE,
-    IDLE,
-    FULL
-)
-from eth_tester.exceptions import TransactionFailed
-from eth_utils import keccak, is_checksum_address, to_checksum_address
+import os
+import sys
+import time
+from constant_sorrow.constants import FULL, NO_WORKER_BONDED, WORKER_NOT_RUNNING
+from decimal import Decimal
+from eth_tester.exceptions import TransactionFailed as TestTransactionFailed
+from eth_utils import to_canonical_address, to_checksum_address
 from twisted.logger import Logger
+from typing import Dict, Iterable, List, Optional, Tuple
 from web3 import Web3
-from web3.contract import ContractFunction
+from web3.exceptions import ValidationError
 
-from nucypher.blockchain.economics import StandardTokenEconomics, EconomicsFactory, BaseEconomics
+from nucypher.blockchain.economics import BaseEconomics, EconomicsFactory, StandardTokenEconomics
 from nucypher.blockchain.eth.agents import (
-    NucypherTokenAgent,
-    StakingEscrowAgent,
-    PolicyManagerAgent,
     AdjudicatorAgent,
     ContractAgency,
-    PreallocationEscrowAgent,
     MultiSigAgent,
-    WorkLockAgent)
-from nucypher.blockchain.eth.decorators import validate_checksum_address, only_me, save_receipt
+    NucypherTokenAgent,
+    PolicyManagerAgent,
+    PreallocationEscrowAgent,
+    StakingEscrowAgent,
+    WorkLockAgent
+)
+from nucypher.blockchain.eth.constants import NULL_ADDRESS
+from nucypher.blockchain.eth.decorators import (
+    only_me,
+    save_receipt,
+    validate_checksum_address
+)
 from nucypher.blockchain.eth.deployers import (
-    NucypherTokenDeployer,
-    StakingEscrowDeployer,
-    PolicyManagerDeployer,
-    StakingInterfaceDeployer,
-    PreallocationEscrowDeployer,
     AdjudicatorDeployer,
     BaseContractDeployer,
-    WorklockDeployer,
-    SeederDeployer,
-    MultiSigDeployer
+    MultiSigDeployer,
+    NucypherTokenDeployer,
+    PolicyManagerDeployer,
+    StakingEscrowDeployer,
+    StakingInterfaceDeployer,
+    StakingInterfaceRouterDeployer,
+    WorklockDeployer
 )
 from nucypher.blockchain.eth.interfaces import BlockchainDeployerInterface, BlockchainInterfaceFactory
-from nucypher.blockchain.eth.interfaces import BlockchainInterface
-from nucypher.blockchain.eth.multisig import Authorization
-from nucypher.blockchain.eth.registry import (
-    AllocationRegistry,
-    BaseContractRegistry,
-    IndividualAllocationRegistry
-)
+from nucypher.blockchain.eth.multisig import Authorization, Proposal
+from nucypher.blockchain.eth.registry import BaseContractRegistry, IndividualAllocationRegistry
+from nucypher.blockchain.eth.signers import KeystoreSigner, Signer, Web3Signer
 from nucypher.blockchain.eth.token import NU, Stake, StakeList, WorkTracker
-from nucypher.blockchain.eth.utils import datetime_to_period, calculate_period_duration, datetime_at_period
+from nucypher.blockchain.eth.utils import (
+    calculate_period_duration,
+    datetime_at_period,
+    datetime_to_period,
+    prettify_eth_amount
+)
 from nucypher.characters.banners import STAKEHOLDER_BANNER
 from nucypher.characters.control.emitters import StdoutEmitter
-from nucypher.cli.painting import (
-    paint_contract_deployment,
-    paint_input_allocation_file,
-    paint_deployed_allocations,
-    write_deployed_allocations_to_csv
-)
+from nucypher.cli.painting.deployment import paint_contract_deployment, paint_input_allocation_file
+from nucypher.cli.painting.transactions import paint_receipt_summary
 from nucypher.config.constants import DEFAULT_CONFIG_ROOT
 from nucypher.crypto.powers import TransactingPower
+from nucypher.network.nicknames import nickname_from_seed
+from nucypher.types import NuNits, Period
 
 
-class NucypherTokenActor:
+class BaseActor:
     """
     Concrete base class for any actor that will interface with NuCypher's ethereum smart contracts.
     """
@@ -108,7 +106,7 @@ class NucypherTokenActor:
         self.registry = registry
         if domains:  # StakeHolder config inherits from character config, which has 'domains' - #1580
             self.network = list(domains)[0]
-        self.token_agent = ContractAgency.get_agent(NucypherTokenAgent, registry=self.registry)  # type: NucypherTokenAgent
+
         self._saved_receipts = list()  # track receipts of transmitted transactions
 
     def __repr__(self):
@@ -119,14 +117,27 @@ class NucypherTokenActor:
 
     def __eq__(self, other) -> bool:
         """Actors are equal if they have the same address."""
-        return bool(self.checksum_address == other.checksum_address)
+        try:
+            return bool(self.checksum_address == other.checksum_address)
+        except AttributeError:
+            return False
 
     @property
     def eth_balance(self) -> Decimal:
         """Return this actors's current ETH balance"""
         blockchain = BlockchainInterfaceFactory.get_interface()  # TODO: EthAgent?  #1509
         balance = blockchain.client.get_balance(self.checksum_address)
-        return blockchain.client.w3.fromWei(balance, 'ether')
+        return Web3.fromWei(balance, 'ether')
+
+
+class NucypherTokenActor(BaseActor):
+    """
+    Actor to interface with the NuCypherToken contract
+    """
+
+    def __init__(self, registry: BaseContractRegistry, **kwargs):
+        super().__init__(registry, **kwargs)
+        self.token_agent = ContractAgency.get_agent(NucypherTokenAgent, registry=self.registry)
 
     @property
     def token_balance(self) -> NU:
@@ -167,12 +178,11 @@ class ContractAdministrator(NucypherTokenActor):
     aux_deployer_classes = (
         WorklockDeployer,
         MultiSigDeployer,
-        SeederDeployer
     )
 
-    # For ownership relinquishment series.
+    # For ownership transfers.
     ownable_deployer_classes = (*dispatched_upgradeable_deployer_classes,
-                                # SeederDeployer
+                                StakingInterfaceRouterDeployer,
                                 )
 
     # Used in the automated deployment series.
@@ -190,26 +200,35 @@ class ContractAdministrator(NucypherTokenActor):
                  registry: BaseContractRegistry,
                  deployer_address: str = None,
                  client_password: str = None,
+                 signer: Signer = None,
                  staking_escrow_test_mode: bool = False,
+                 is_transacting: bool = True,  # FIXME: Workaround to be able to build MultiSig TXs
                  economics: BaseEconomics = None):
         """
-        Note: super() is not called here to avoid setting the token agent.
-        TODO: Review this logic ^^ "bare mode".  #1510
+        Note: super() is not called here to avoid setting the token agent.  TODO: call super but use "bare mode" without token agent.  #1510
         """
         self.log = Logger("Deployment-Actor")
 
         self.deployer_address = deployer_address
         self.checksum_address = self.deployer_address
         self.economics = economics or StandardTokenEconomics()
+        self.staking_escrow_test_mode = staking_escrow_test_mode
 
         self.registry = registry
         self.preallocation_escrow_deployers = dict()
         self.deployers = {d.contract_name: d for d in self.all_deployer_classes}
 
-        self.deployer_power = TransactingPower(password=client_password, account=deployer_address, cache=True)
-        self.transacting_power = self.deployer_power
-        self.transacting_power.activate()
-        self.staking_escrow_test_mode = staking_escrow_test_mode
+        # Powers
+        if is_transacting:
+            self.deployer_power = TransactingPower(signer=signer,
+                                                   password=client_password,
+                                                   account=deployer_address,
+                                                   cache=True)
+            self.transacting_power = self.deployer_power
+            self.transacting_power.activate()
+        else:
+            self.deployer_power = None
+            self.transacting_power = None
 
         self.sidekick_power = None
         self.sidekick_address = None
@@ -221,7 +240,7 @@ class ContractAdministrator(NucypherTokenActor):
     @validate_checksum_address
     def recruit_sidekick(self, sidekick_address: str, sidekick_password: str):
         self.sidekick_power = TransactingPower(account=sidekick_address, password=sidekick_password, cache=True)
-        if self.sidekick_power.device:
+        if self.sidekick_power.is_device:
             raise ValueError("Holy Wallet! Sidekicks can only be SW accounts")
         self.sidekick_address = sidekick_address
 
@@ -248,32 +267,15 @@ class ContractAdministrator(NucypherTokenActor):
             raise self.UnknownContract(contract_name)
         return Deployer
 
-    @staticmethod
-    def collect_deployment_secret(deployer) -> str:
-        secret = click.prompt(f'Enter {deployer.contract_name} Deployment Secret',
-                              hide_input=True,
-                              confirmation_prompt=True)
-        return secret
-
-    def collect_deployment_secrets(self) -> dict:
-        secrets = dict()
-        for deployer in self.upgradeable_deployer_classes:
-            secrets[deployer.contract_name] = self.collect_deployment_secret(deployer)
-
-        if len(secrets.values()) != len(set(secrets.values())):  # i.e., if there are duplicated secrets
-            raise ValueError("You can't use the same secret for multiple contracts")
-
-        return secrets
-
     def deploy_contract(self,
                         contract_name: str,
                         gas_limit: int = None,
-                        plaintext_secret: str = None,
                         deployment_mode=FULL,
                         ignore_deployed: bool = False,
                         progress=None,
                         confirmations: int = 0,
                         deployment_parameters: dict = None,
+                        emitter=None,
                         *args, **kwargs,
                         ) -> Tuple[dict, BaseContractDeployer]:
 
@@ -290,73 +292,55 @@ class ContractAdministrator(NucypherTokenActor):
 
         self.transacting_power.activate()  # Activate the TransactingPower in case too much time has passed
         if Deployer._upgradeable:
-            is_initial_deployment = deployment_mode != BARE  # i.e., we also deploy a dispatcher
-            if is_initial_deployment and not plaintext_secret:
-                raise ValueError("An upgrade secret must be passed to perform initial deployment of a Dispatcher.")
-            secret_hash = None
-            if plaintext_secret:
-                secret_hash = keccak(bytes(plaintext_secret, encoding='utf-8'))
-            receipts = deployer.deploy(secret_hash=secret_hash,
-                                       gas_limit=gas_limit,
+            receipts = deployer.deploy(gas_limit=gas_limit,
                                        progress=progress,
                                        ignore_deployed=ignore_deployed,
                                        confirmations=confirmations,
                                        deployment_mode=deployment_mode,
+                                       emitter=emitter,
                                        **deployment_parameters)
         else:
             receipts = deployer.deploy(gas_limit=gas_limit,
                                        progress=progress,
                                        confirmations=confirmations,
                                        deployment_mode=deployment_mode,
+                                       ignore_deployed=ignore_deployed,
+                                       emitter=emitter,
                                        **deployment_parameters)
         return receipts, deployer
 
     def upgrade_contract(self,
                          contract_name: str,
-                         existing_plaintext_secret: str,
-                         new_plaintext_secret: str,
                          ignore_deployed: bool = False
                          ) -> dict:
         Deployer = self.__get_deployer(contract_name=contract_name)
         deployer = Deployer(registry=self.registry, deployer_address=self.deployer_address)
-        new_secret_hash = keccak(bytes(new_plaintext_secret, encoding='utf-8'))
-        receipts = deployer.upgrade(existing_secret_plaintext=bytes(existing_plaintext_secret, encoding='utf-8'),
-                                    new_secret_hash=new_secret_hash,
-                                    ignore_deployed=ignore_deployed)
+        receipts = deployer.upgrade(ignore_deployed=ignore_deployed)
         return receipts
 
     def retarget_proxy(self,
                        contract_name: str,
                        target_address: str,
-                       existing_plaintext_secret: str,
-                       new_plaintext_secret: str,
                        just_build_transaction: bool = False):
         Deployer = self.__get_deployer(contract_name=contract_name)
         deployer = Deployer(registry=self.registry, deployer_address=self.deployer_address)
-        new_secret_hash = keccak(bytes(new_plaintext_secret, encoding='utf-8'))
         result = deployer.retarget(target_address=target_address,
-                                   existing_secret_plaintext=bytes(existing_plaintext_secret, encoding='utf-8'),
-                                   new_secret_hash=new_secret_hash,
                                    just_build_transaction=just_build_transaction)
         return result
 
-    def rollback_contract(self, contract_name: str, existing_plaintext_secret: str, new_plaintext_secret: str):
+    def rollback_contract(self, contract_name: str):
         Deployer = self.__get_deployer(contract_name=contract_name)
         deployer = Deployer(registry=self.registry, deployer_address=self.deployer_address)
-        new_secret_hash = keccak(bytes(new_plaintext_secret, encoding='utf-8'))
-        receipts = deployer.rollback(existing_secret_plaintext=bytes(existing_plaintext_secret, encoding='utf-8'),
-                                     new_secret_hash=new_secret_hash)
+        receipts = deployer.rollback()
         return receipts
 
     def deploy_network_contracts(self,
-                                 secrets: dict,
                                  interactive: bool = True,
                                  emitter: StdoutEmitter = None,
                                  etherscan: bool = False,
                                  ignore_deployed: bool = False) -> dict:
         """
 
-        :param secrets: Contract upgrade secrets dictionary
         :param interactive: If True, wait for keypress after each contract deployment
         :param emitter: A console output emitter instance. If emitter is None, no output will be echoed to the console.
         :param etherscan: Open deployed contracts in Etherscan
@@ -392,13 +376,14 @@ class ContractAdministrator(NucypherTokenActor):
                 if deployer_class in self.standard_deployer_classes:
                     receipts, deployer = self.deploy_contract(contract_name=deployer_class.contract_name,
                                                               gas_limit=gas_limit,
-                                                              progress=bar)
+                                                              progress=bar,
+                                                              emitter=emitter)
                 else:
                     receipts, deployer = self.deploy_contract(contract_name=deployer_class.contract_name,
-                                                              plaintext_secret=secrets[deployer_class.contract_name],
                                                               gas_limit=gas_limit,
                                                               progress=bar,
-                                                              ignore_deployed=ignore_deployed)
+                                                              ignore_deployed=ignore_deployed,
+                                                              emitter=emitter)
 
                 if emitter:
                     blockchain = BlockchainInterfaceFactory.get_interface()
@@ -414,240 +399,91 @@ class ContractAdministrator(NucypherTokenActor):
 
         return deployment_receipts
 
-    def relinquish_ownership(self,
-                             new_owner: str,
-                             emitter: StdoutEmitter = None,
-                             interactive: bool = True,
-                             transaction_gas_limit: int = None) -> dict:
-
-        if not is_checksum_address(new_owner):
-            raise ValueError(f"{new_owner} is an invalid EIP-55 checksum address.")
-
-        receipts = dict()
-
-        for contract_deployer in self.ownable_deployer_classes:
-            deployer = contract_deployer(registry=self.registry, deployer_address=self.deployer_address)
-            deployer.transfer_ownership(new_owner=new_owner, transaction_gas_limit=transaction_gas_limit)
-
-            if emitter:
-                emitter.echo(f"Transferred ownership of {deployer.contract_name} to {new_owner}")
-
-            if interactive:
-                click.pause(info="Press any key to continue")
-
-            receipts[contract_deployer.contract_name] = receipts
-
-        return receipts
-
-    def deploy_beneficiary_contracts(self,
-                                     allocations: List[Dict[str, Union[str, int]]],
-                                     allocation_outfile: str = None,
-                                     allocation_registry: AllocationRegistry = None,
-                                     output_dir: str = None,
-                                     crash_on_failure: bool = True,
-                                     interactive: bool = True,
-                                     emitter: StdoutEmitter = None,
-                                     ) -> Dict[str, dict]:
+    def batch_deposits(self,
+                       allocation_data_filepath: str,
+                       interactive: bool = True,
+                       emitter: StdoutEmitter = None,
+                       gas_limit: int = None
+                       ) -> Dict[str, dict]:
         """
-        The allocation file contains a list of allocations, each of them composed of:
-          * 'beneficiary_address': Checksum address of the beneficiary
-          * 'name': User-friendly name of the beneficiary (Optional)
-          * 'amount': Amount of tokens locked, in NuNits
-          * 'duration_seconds': Lock duration expressed in seconds
+        The allocations file is a JSON or CSV file containing a list of substakes.
+        Each substake is comprised of a staker address, an amount of tokens locked (in NuNits),
+        and a lock duration (in periods).
 
         It accepts both CSV and JSON formats. Example allocation file in CSV format:
 
-        "beneficiary_address","name","amount","duration_seconds"
-        "0xdeadbeef","H. E. Pennypacker",100,31536000
-        "0xabced120","",133432,31536000
-        "0xf7aefec2","",999,31536000
+        "checksum_address","amount","lock_periods"
+        "0xFABADA",123456,30
+        "0xFABADA",789,45
 
         Example allocation file in JSON format:
 
-        [ {'beneficiary_address': '0xdeadbeef', 'name': 'H. E. Pennypacker', 'amount': 100, 'duration_seconds': 31536000},
-          {'beneficiary_address': '0xabced120', 'amount': 133432, 'duration_seconds': 31536000},
-          {'beneficiary_address': '0xf7aefec2', 'amount': 999, 'duration_seconds': 31536000}]
-
+        [ {"checksum_address": "0xFABADA", "amount": 123456, "lock_periods": 30},
+          {"checksum_address": "0xFABADA", "amount": 789, "lock_periods": 45}]
         """
 
         if interactive and not emitter:
             raise ValueError("'emitter' is a required keyword argument when interactive is True.")
 
-        if allocation_registry and allocation_outfile:
-            raise self.ActorError("Pass either allocation registry or allocation_outfile, not both.")
-        if allocation_registry is None:
-            allocation_registry = AllocationRegistry(filepath=allocation_outfile)
+        allocator = Allocator(allocation_data_filepath, self.registry, self.deployer_address)
+
+        # TODO: Check validity of input address (check TX)
 
         if emitter:
-            paint_input_allocation_file(emitter, allocations)
+            blockchain = BlockchainInterfaceFactory.get_interface()
+            chain_name = blockchain.client.chain_name
+            paint_input_allocation_file(emitter, allocator.allocations)
 
         if interactive:
-            click.confirm("Continue with the allocation process?", abort=True)
+            click.confirm("Continue with the allocations process?", abort=True)
 
-        total_to_allocate = NU.from_nunits(sum(allocation['amount'] for allocation in allocations))
-        balance = ContractAgency.get_agent(NucypherTokenAgent, self.registry).get_balance(self.deployer_address)
-        if balance < total_to_allocate:
-            raise ValueError(f"Not enough tokens to allocate. We need at least {total_to_allocate}.")
-
-        allocation_receipts, failed, allocated = dict(), list(), list()
-        total_deployment_transactions = len(allocations) * 4
-
-        # Create an allocation template file, containing the allocation contract ABI and placeholder values
-        # for the beneficiary and contract addresses. This file will be shared with all allocation users.
-        empty_allocation_escrow_deployer = PreallocationEscrowDeployer(registry=self.registry)
-        allocation_contract_abi = empty_allocation_escrow_deployer.get_contract_abi()
-        allocation_template = {
-            "BENEFICIARY_ADDRESS": ["ALLOCATION_CONTRACT_ADDRESS", allocation_contract_abi]
-        }
-
-        if not output_dir:
-            output_dir = Path(allocation_registry.filepath).parent  # Use same folder as allocation registry
-        template_filename = IndividualAllocationRegistry.REGISTRY_NAME
-        template_filepath = os.path.join(output_dir, template_filename)
-        AllocationRegistry(filepath=template_filepath).write(registry_data=allocation_template)
-        if emitter:
-            emitter.echo(f"Saved allocation template file to {template_filepath}", color='blue', bold=True)
-
-        already_enrolled = [a['beneficiary_address'] for a in allocations
-                            if allocation_registry.is_beneficiary_enrolled(a['beneficiary_address'])]
-        if already_enrolled:
-            raise ValueError(f"The following beneficiaries are already enrolled in allocation registry "
-                             f"({allocation_registry.filepath}): {already_enrolled}")
-
-        # Deploy each allocation contract
-        with click.progressbar(length=total_deployment_transactions,
+        batch_deposit_receipts, failed = dict(), False
+        with click.progressbar(length=len(allocator.allocations),
                                label="Allocation progress",
                                show_eta=False) as bar:
-            bar.short_limit = 0
-            for allocation in allocations:
 
-                beneficiary = allocation['beneficiary_address']
-                name = allocation.get('name', 'No name provided')
+            while allocator.pending_deposits and not failed:
 
-                if interactive:
-                    click.pause(info=f"\nPress any key to continue with allocation for "
-                                     f"beneficiary {beneficiary} ({name})")
-
-                if emitter:
-                    emitter.echo(f"\nDeploying PreallocationEscrow contract for beneficiary {beneficiary} ({name})...")
-                    bar._last_line = None
-                    bar.render_progress()
-
-                amount = allocation['amount']
-                duration = allocation['duration_seconds']
+                self.activate_deployer(refresh=True)
 
                 try:
-                    deployer = PreallocationEscrowDeployer(registry=self.registry,
-                                                           deployer_address=self.deployer_address,
-                                                           sidekick_address=self.sidekick_address,
-                                                           allocation_registry=allocation_registry)
-
-                    # 0 - Activate a TransactingPower (use the Sidekick if necessary)
-                    use_sidekick = bool(self.sidekick_power)
-                    if use_sidekick:
-                        self.activate_sidekick(refresh=True)
-                    else:
-                        self.activate_deployer(refresh=True)
-
-                    # 1 - Deploy the contract
-                    deployer.deploy(use_sidekick=use_sidekick, progress=bar)
-
-                    # 2 - Assign ownership to beneficiary
-                    deployer.assign_beneficiary(checksum_address=beneficiary, use_sidekick=use_sidekick, progress=bar)
-
-                    # 3 - Use main deployer account to do the initial deposit
-                    self.activate_deployer(refresh=False)
-                    deployer.initial_deposit(value=amount, duration_seconds=duration, progress=bar)
-
-                    # 4 - Enroll in allocation registry
-                    deployer.enroll_principal_contract()
-
-                except TransactionFailed as e:
-                    if crash_on_failure:
-                        raise
-                    message = f"Failed allocation transaction for {NU.from_nunits(amount)} to {beneficiary}: {e}"
-                    self.log.debug(message)
+                    deposited_stakers, receipt = allocator.deposit_next_batch(sender_address=self.deployer_address,
+                                                                              gas_limit=gas_limit)
+                except (TestTransactionFailed, ValidationError, ValueError):  # TODO: 1950
                     if emitter:
-                        emitter.echo(message=message, color='red', bold=True)
-                    failed.append(allocation)
-                    continue
+                        emitter.echo(f"\nFailed to deploy next batch. These addresses weren't funded:", color="yellow")
+                        for staker in allocator.pending_deposits:
+                            emitter.echo(f"\t{staker}", color="yellow")
+                        emitter.echo(f"\nThe failure is caused by the following exception:")
 
+                    for line in traceback.format_exception(*sys.exc_info()):
+                        emitter.echo(line, color='red')
+                    failed = True
                 else:
-                    allocation_receipts[beneficiary] = deployer.deployment_receipts
-                    allocation_contract_address = deployer.contract_address
-                    self.log.info(f"Created {deployer.contract_name} contract at {allocation_contract_address} "
-                                  f"for beneficiary {beneficiary}.")
-                    allocated.append((allocation, allocation_contract_address))
+                    number_of_deposits = len(deposited_stakers)
+                    if emitter:
+                        emitter.echo(f"\nDeployed allocations for {number_of_deposits} stakers:")
+                        for staker in deposited_stakers:
+                            emitter.echo(f"\t{staker}")
+                        emitter.echo()
+                        bar._last_line = None
+                        bar.render_progress()
 
-                    # Create individual allocation file
-                    individual_allocation_filename = f'allocation-{beneficiary}.json'
-                    individual_allocation_filepath = os.path.join(output_dir, individual_allocation_filename)
-                    individual_allocation_file_data = {
-                        'beneficiary_address': beneficiary,
-                        'contract_address': allocation_contract_address
-                    }
-                    with open(individual_allocation_filepath, 'w') as outfile:
-                        json.dump(individual_allocation_file_data, outfile)
+                    bar.update(number_of_deposits)
 
                     if emitter:
-                        blockchain = BlockchainInterfaceFactory.get_interface()
-                        paint_contract_deployment(contract_name=deployer.contract_name,
-                                                  receipts=deployer.deployment_receipts,
-                                                  contract_address=deployer.contract_address,
-                                                  emitter=emitter,
-                                                  chain_name=blockchain.client.chain_name,
-                                                  open_in_browser=False)
-                        emitter.echo(f"Saved individual allocation file to {individual_allocation_filepath}",
-                                     color='blue', bold=True)
+                        emitter.echo()
+                        paint_receipt_summary(emitter=emitter,
+                                              receipt=receipt,
+                                              chain_name=chain_name,
+                                              transaction_type=f'batch_deposit_{number_of_deposits}_stakers')
 
-            if emitter:
-                paint_deployed_allocations(emitter, allocated, failed)
+                    batch_deposit_receipts.update({staker: {'batch_deposit': receipt} for staker in deposited_stakers})
 
-            csv_filename = f'allocation-summary-{self.deployer_address[:6]}-{maya.now().epoch}.csv'
-            csv_filepath = os.path.join(output_dir, csv_filename)
-            write_deployed_allocations_to_csv(csv_filepath, allocated, failed)
-            if emitter:
-                emitter.echo(f"Saved allocation summary CSV to {csv_filepath}", color='blue', bold=True)
+                    if interactive:
+                        click.pause(info=f"\nPress any key to continue with next batch of allocations")
 
-            if failed:
-                self.log.critical(f"FAILED TOKEN ALLOCATION - {len(failed)} allocations failed.")
-
-        return allocation_receipts
-
-    @staticmethod
-    def __read_allocation_data(filepath: str) -> list:
-        with open(filepath, 'r') as allocation_file:
-            if filepath.endswith(".csv"):
-                reader = csv.DictReader(allocation_file)
-                allocation_data = list(reader)
-            else:  # Assume it's JSON by default
-                allocation_data = json.load(allocation_file)
-
-        # Pre-process allocation data
-        for entry in allocation_data:
-            entry['beneficiary_address'] = to_checksum_address(entry['beneficiary_address'])
-            entry['amount'] = int(entry['amount'])
-            entry['duration_seconds'] = int(entry['duration_seconds'])
-
-        return allocation_data
-
-    def deploy_beneficiaries_from_file(self,
-                                       allocation_data_filepath: str,
-                                       allocation_outfile: str = None,
-                                       emitter=None,
-                                       interactive=None) -> dict:
-
-        allocations = self.__read_allocation_data(filepath=allocation_data_filepath)
-        receipts = self.deploy_beneficiary_contracts(allocations=allocations,
-                                                     allocation_outfile=allocation_outfile,
-                                                     emitter=emitter,
-                                                     interactive=interactive,
-                                                     crash_on_failure=False)
-        # Save transaction metadata
-        receipts_filepath = self.save_deployment_receipts(receipts=receipts, filename_prefix='allocation')
-        if emitter:
-            emitter.echo(f"Saved allocation receipts to {receipts_filepath}", color='blue', bold=True)
-        return receipts
+        return batch_deposit_receipts
 
     def save_deployment_receipts(self, receipts: dict, filename_prefix: str = 'deployment') -> str:
         config_root = DEFAULT_CONFIG_ROOT  # We force the use of the default here.
@@ -667,27 +503,169 @@ class ContractAdministrator(NucypherTokenActor):
             file.write(data)
         return filepath
 
-    def set_min_reward_rate_range(self,
-                                  minimum: int,
-                                  default: int,
-                                  maximum: int,
-                                  transaction_gas_limit: int = None) -> dict:
+    def set_fee_rate_range(self,
+                           minimum: int,
+                           default: int,
+                           maximum: int,
+                           transaction_gas_limit: int = None) -> dict:
 
         policy_manager_deployer = PolicyManagerDeployer(registry=self.registry,
                                                         deployer_address=self.deployer_address,
                                                         economics=self.economics)
-        receipt = policy_manager_deployer.set_min_reward_rate_range(minimum=minimum,
-                                                                    default=default,
-                                                                    maximum=maximum,
-                                                                    gas_limit=transaction_gas_limit)
+        receipt = policy_manager_deployer.set_fee_rate_range(minimum=minimum,
+                                                             default=default,
+                                                             maximum=maximum,
+                                                             gas_limit=transaction_gas_limit)
         return receipt
 
 
-class MultiSigActor(NucypherTokenActor):
+class Allocator:
+
+    class AllocationInputError(Exception):
+        """Raised when the allocation data file doesn't have the correct format"""
+
+    OCCUPATION_RATIO = 0.9  # When there's no explicit gas limit, we'll try to use the block limit up to this ratio
+
+    def __init__(self, filepath: str, registry, deployer_address):
+
+        self.log = Logger("allocator")
+        self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent,
+                                                      registry=registry)  # type: StakingEscrowAgent
+        self.max_substakes = self.staking_agent.contract.functions.MAX_SUB_STAKES().call()
+        self.allocations = dict()
+        self.deposited = set()
+        self.economics = EconomicsFactory.get_economics(registry)
+
+        self.__total_to_allocate = 0
+        self.__process_allocation_data(str(filepath))
+        self.__approve_token_transfer(registry, deployer_address)
+
+    def __process_allocation_data(self, filepath: str):
+        try:
+            with open(filepath, 'r') as allocation_file:
+                if filepath.endswith(".csv"):
+                    reader = csv.DictReader(allocation_file)
+                    allocation_data = list(reader)
+                else:  # Assume it's JSON by default
+                    allocation_data = json.load(allocation_file)
+        except FileNotFoundError:
+            raise self.AllocationInputError(f"No allocation data file found at {filepath}")
+
+        # Pre-process allocations data
+        for entry in allocation_data:
+            try:
+                staker = to_checksum_address(entry['checksum_address'])
+                amount = int(entry['amount'])
+                lock_periods = int(entry['lock_periods'])
+            except (KeyError, ValueError) as e:
+                raise self.AllocationInputError(f"Invalid allocation data: {str(e)}")
+            else:
+                self._add_substake(staker, amount, lock_periods)
+                self.__total_to_allocate += amount
+
+    def __approve_token_transfer(self, registry, deployer_address):
+        token_agent = ContractAgency.get_agent(NucypherTokenAgent, registry=registry)  # type: NucypherTokenAgent
+
+        balance = token_agent.get_balance(deployer_address)
+        if balance < self.__total_to_allocate:
+            raise ValueError(f"Not enough tokens to allocate."
+                             f"We need at least {NU.from_nunits(self.__total_to_allocate)}.")
+
+        allowance = token_agent.get_allowance(owner=deployer_address, spender=self.staking_agent.contract_address)
+        if allowance < self.__total_to_allocate:
+            self.log.debug(f"Allocating a total of {NU.from_nunits(self.__total_to_allocate)}")
+            allowance_function = token_agent.contract.functions.increaseAllowance(self.staking_agent.contract_address,
+                                                                                  self.__total_to_allocate - allowance)
+            _allowance_receipt = self.staking_agent.blockchain.send_transaction(contract_function=allowance_function,
+                                                                                sender_address=deployer_address)
+
+    def _add_substake(self, staker, amount, lock_periods):
+        try:
+            substakes = self.allocations[staker]
+            if len(substakes) >= self.max_substakes:
+                raise ValueError(f"Number of sub-stakes, {len(substakes)}, must be ≤ {self.max_substakes}")
+        except KeyError:
+            if list(self.staking_agent.get_all_stakes(staker_address=staker)):
+                raise ValueError(f"{staker} is already a staker. It cannot be included in a batch deposit")
+            substakes = list()
+            self.allocations[staker] = substakes
+
+        message = f"Invalid substake for {staker}: "
+        if amount < self.economics.minimum_allowed_locked:
+            message += f"Amount ({amount}) is below the min allowed ({self.economics.minimum_allowed_locked})"
+            raise ValueError(message)
+        overall_amount = sum([amount for amount, periods in substakes])
+        if overall_amount + amount > self.economics.maximum_allowed_locked:
+            message += f"Total amount is above the max allowed ({self.economics.maximum_allowed_locked})"
+            raise ValueError(message)
+        if lock_periods < self.economics.minimum_locked_periods:
+            message += f"Lock periods ({lock_periods}) are below the min ({self.economics.minimum_locked_periods})"
+            raise ValueError(message)
+
+        substakes.append((amount, lock_periods))
+
+    def deposit_next_batch(self,
+                           sender_address: str,
+                           gas_limit: int = None) -> Tuple[List[str], dict]:
+
+        pending_stakers = self.pending_deposits
+
+        self.log.debug(f"Constructing next batch. "
+                       f"Currently, {len(pending_stakers)} stakers pending, {len(self.deposited)} deposited.")
+
+        batch_size = 1
+        if not gas_limit:
+            block_limit = self.staking_agent.blockchain.client.w3.eth.getBlock(block_identifier='latest').gasLimit
+            gas_limit = int(self.OCCUPATION_RATIO * block_limit)
+        self.log.debug(f"Gas limit for this batch is {gas_limit}")
+
+        # Execute a dry-run of the batch deposit method, incrementing the batch size, until it's too big and fails.
+        last_good_batch = None
+        while batch_size <= len(pending_stakers):
+            test_batch = {staker: self.allocations[staker] for staker in pending_stakers[:batch_size]}
+            batch_parameters = self.staking_agent.construct_batch_deposit_parameters(deposits=test_batch)
+            try:
+                estimated_gas = self.staking_agent.batch_deposit(*batch_parameters,
+                                                                 sender_address=sender_address,
+                                                                 dry_run=True,
+                                                                 gas_limit=gas_limit)
+            except (TestTransactionFailed, ValidationError, ValueError):  # TODO: 1950
+                self.log.debug(f"Batch of {len(test_batch)} is too big. Let's stick to {len(test_batch)-1} then")
+                break
+            else:
+                self.log.debug(f"Batch of {len(test_batch)} stakers fits in single TX ({estimated_gas} gas). "
+                               f"Trying to squeeze one more staker...")
+                last_good_batch = test_batch
+                batch_size += 1
+
+        if not last_good_batch:
+            message = "It was not possible to find a new batch of deposits. "
+            raise ValueError(message)
+
+        batch_parameters = self.staking_agent.construct_batch_deposit_parameters(deposits=last_good_batch)
+        receipt = self.staking_agent.batch_deposit(*batch_parameters,
+                                                   sender_address=sender_address,
+                                                   gas_limit=gas_limit)
+
+        deposited_stakers = list(last_good_batch.keys())
+        self.deposited.update(deposited_stakers)
+        return deposited_stakers, receipt
+
+    @property
+    def pending_deposits(self) -> List[str]:
+        pending_deposits = [staker for staker in self.allocations.keys() if staker not in self.deposited]
+        return pending_deposits
+
+
+class MultiSigActor(BaseActor):
+    class UnknownExecutive(Exception):
+        """
+        Raised when Executive is not listed as a owner of the MultiSig.
+        """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.multisig_agent = ContractAgency.get_agent(MultiSigAgent, registry=self.registry)  # type: MultiSigAgent
+        self.multisig_agent = ContractAgency.get_agent(MultiSigAgent, registry=self.registry)
 
 
 class Trustee(MultiSigActor):
@@ -700,56 +678,87 @@ class Trustee(MultiSigActor):
     class NoAuthorizations(RuntimeError):
         """Raised when there are zero authorizations."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self,
+                 checksum_address: str,
+                 client_password: str = None,
+                 *args, **kwargs):
+        super().__init__(checksum_address=checksum_address, *args, **kwargs)
         self.authorizations = dict()
+        self.executive_addresses = tuple(self.multisig_agent.owners)  # TODO: Investigate unresolved reference to .owners (linter)
+        if client_password:  # TODO: Consider an is_transacting parameter
+            self.transacting_power = TransactingPower(password=client_password,
+                                                      account=checksum_address)
+            self.transacting_power.activate()
 
-    def add_authorization(self, authorization):
-        self.authorizations[authorization.trustee_address] = authorization
+    def add_authorization(self, authorization, proposal: Proposal) -> str:
+        executive_address = authorization.recover_executive_address(proposal)
+        if executive_address not in self.executive_addresses:
+            raise self.UnknownExecutive(f"Executive {executive_address} is not listed as an owner of the MultiSig.")
+        if executive_address in self.authorizations:
+            raise ValueError(f"There is already an authorization from executive {executive_address}")
 
-    def combine_authorizations(self) -> Tuple[List[bytes], ...]:
+        self.authorizations[executive_address] = authorization
+        return executive_address
+
+    def _combine_authorizations(self) -> Tuple[List[bytes], ...]:
         if not self.authorizations:
             raise self.NoAuthorizations
 
         all_v, all_r, all_s = list(), list(), list()
-        # Authorizations (i.e., signatures) must be provided in increasing order by signing address
-        for trustee_address, authorization in sorted(self.authorizations.items()):
-            v, r, s = authorization.get_components()
-            all_v.append(v)
+
+        def order_by_address(executive_address_to_sort):
+            """
+            Authorizations (i.e., signatures) must be provided to the MultiSig in increasing order by signing address
+            """
+            return Web3.toInt(to_canonical_address(executive_address_to_sort))
+
+        for executive_address in sorted(self.authorizations.keys(), key=order_by_address):
+            authorization = self.authorizations[executive_address]
+            r, s, v = authorization.components
+            all_v.append(Web3.toInt(v))  # v values are passed to the contract as ints, not as bytes
             all_r.append(r)
             all_s.append(s)
 
+        return all_r, all_s, all_v
+
+    def execute(self, proposal: Proposal) -> dict:
+
+        if proposal.trustee_address != self.checksum_address:
+            raise ValueError(f"This proposal is meant to be executed by trustee {proposal.trustee_address}, "
+                             f"not by this trustee ({self.checksum_address})")
         # TODO: check for inconsistencies (nonce, etc.)
-        return all_v, all_r, all_s
 
-    def execute(self, contract_function: ContractFunction) -> dict:
-        v, r, s = self.combine_authorizations()
-        receipt = self.multisig_agent.execute(sender_address=self.checksum_address,
+        r, s, v = self._combine_authorizations()
+        receipt = self.multisig_agent.execute(sender_address=self.checksum_address,   # TODO: Investigate unresolved reference to .execute
                                               v=v, r=r, s=s,
-                                              transaction_function=contract_function,
-                                              value=None)  # TODO: Design Flaw...
+                                              destination=proposal.target_address,
+                                              value=proposal.value,
+                                              data=proposal.data)
         return receipt
 
-    def change_threshold(self, new_threshold: int) -> dict:
-        # TODO: Implement Agent method for change threshold for function binding
-        receipt = self.multisig_agent.execute()
-        return receipt
+    def create_transaction_proposal(self, transaction):
+        proposal = Proposal.from_transaction(transaction,
+                                             multisig_agent=self.multisig_agent,
+                                             trustee_address=self.checksum_address)
+        return proposal
 
-    def produce_data_to_sign(self, transaction):
-        data_to_sign = dict(trustee_address=transaction['from'],
-                            target_address=transaction['to'],
-                            value=transaction['value'],
-                            data=transaction['data'],
-                            nonce=self.multisig_agent.nonce)
+    # MultiSig management proposals
 
-        unsigned_digest = self.multisig_agent.get_unsigned_transaction_hash(**data_to_sign)
+    def propose_adding_owner(self, new_owner_address: str, evidence: str) -> Proposal:
+        # TODO: Use evidence to ascertain new owner can transact with this address
+        tx = self.multisig_agent.build_add_owner_tx(new_owner_address=new_owner_address)
+        proposal = self.create_transaction_proposal(tx)
+        return proposal
 
-        data_for_multisig_executives = {
-            'parameters': data_to_sign,
-            'digest': unsigned_digest.hex()
-        }
+    def propose_removing_owner(self, owner_address: str) -> Proposal:
+        tx = self.multisig_agent.build_remove_owner_tx(owner_address=owner_address)
+        proposal = self.create_transaction_proposal(tx)
+        return proposal
 
-        return data_for_multisig_executives
+    def propose_changing_threshold(self, new_threshold: int) -> Proposal:
+        tx = self.multisig_agent.build_change_threshold_tx(new_threshold)
+        proposal = self.create_transaction_proposal(tx)
+        return proposal
 
 
 class Executive(MultiSigActor):
@@ -757,27 +766,29 @@ class Executive(MultiSigActor):
     An actor having the power to authorize transaction executions to a delegated trustee.
     """
 
-    def sign_hash(self, unsigned_hash: bytes) -> bytes:
-        blockchain = self.multisig_agent.blockchain
-        signed_hash = blockchain.transacting_power.sign_hash(unsigned_hash=unsigned_hash)
-        return signed_hash
+    def __init__(self,
+                 checksum_address: str,
+                 signer: Signer = None,
+                 client_password: str = None,
+                 *args, **kwargs):
+        super().__init__(checksum_address=checksum_address, *args, **kwargs)
 
-    def authorize(self, trustee, contract_function: ContractFunction) -> Authorization:
-        try:
-            transaction = contract_function.buildTransaction()
-        except (TransactionFailed, ValueError):
-            # TODO - Handle Validation Failure
-            raise
-        unsigned_transaction_hash = self.multisig_agent.get_unsigned_transaction_hash(
-            trustee_address=trustee.checksum_address,
-            target_address=contract_function.address,
-            value=transaction['value'],
-            data=transaction['data'],
-            nonce=trustee.current_nonce
-        )
-        signed_transaction_hash = self.sign_hash(unsigned_hash=unsigned_transaction_hash)
-        authorization = self.Authorization(trustee_address=trustee.checksum_address,
-                                           signed_transaction_hash=signed_transaction_hash)
+        if checksum_address not in self.multisig_agent.owners:
+            raise self.UnknownExecutive(f"Executive {checksum_address} is not listed as an owner of the MultiSig. "
+                                        f"Current owners are {self.multisig_agent.owners}")
+        self.signer = signer
+        if signer:
+            self.transacting_power = TransactingPower(signer=signer,
+                                                      password=client_password,
+                                                      account=checksum_address)
+            self.transacting_power.activate()
+
+    def authorize_proposal(self, proposal) -> Authorization:
+        # TODO: Double-check that the digest corresponds to the real data to sign
+        signature = self.signer.sign_data_for_validator(account=self.checksum_address,
+                                                        message=proposal.application_specific_data,
+                                                        validator_address=self.multisig_agent.contract_address)
+        authorization = Authorization.deserialize(data=Web3.toBytes(hexstr=signature))
         return authorization
 
 
@@ -804,8 +815,8 @@ class Staker(NucypherTokenActor):
         self.__worker_address = None
 
         # Blockchain
-        self.policy_agent = ContractAgency.get_agent(PolicyManagerAgent, registry=self.registry)   # type: PolicyManagerAgent
-        self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)  # type: StakingEscrowAgent
+        self.policy_agent = ContractAgency.get_agent(PolicyManagerAgent, registry=self.registry)
+        self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)
         self.economics = EconomicsFactory.get_economics(registry=self.registry)
 
         # Staking via contract
@@ -829,7 +840,7 @@ class Staker(NucypherTokenActor):
 
     def to_dict(self) -> dict:
         stake_info = [stake.to_stake_info() for stake in self.stakes]
-        worker_address = self.worker_address or BlockchainInterface.NULL_ADDRESS
+        worker_address = self.worker_address or NULL_ADDRESS
         staker_funds = {'ETH': int(self.eth_balance), 'NU': int(self.token_balance)}
         staker_payload = {'staker': self.checksum_address,
                           'balances': staker_funds,
@@ -843,6 +854,14 @@ class Staker(NucypherTokenActor):
         self.stakes.refresh()
         return bool(self.stakes)
 
+    def owned_tokens(self) -> NU:
+        """
+        Returns all tokens that belong to the staker, including locked, unlocked and rewards.
+        """
+        raw_value = self.staking_agent.owned_tokens(staker_address=self.checksum_address)
+        value = NU.from_nunits(raw_value)
+        return value
+
     def locked_tokens(self, periods: int = 0) -> NU:
         """Returns the amount of tokens this staker has locked for a given duration in periods."""
         self.stakes.refresh()
@@ -852,10 +871,35 @@ class Staker(NucypherTokenActor):
 
     @property
     def current_stake(self) -> NU:
-        """
-        The total number of staked tokens, i.e., tokens locked in the current period.
-        """
+        """The total number of staked tokens, i.e., tokens locked in the current period."""
         return self.locked_tokens(periods=0)
+
+    @property
+    def active_stakes(self) -> Iterable[Stake]:
+        """Returns active stakes for this staker."""
+        stakes = (stake for stake in self.stakes if stake.is_active)
+        return stakes
+
+    @property
+    def sorted_stakes(self) -> List[Stake]:
+        """Returns a list of active stakes sorted by account wallet index."""
+        stakes = sorted(self.active_stakes, key=lambda s: s.address_index_ordering_key)
+        return stakes
+
+    def __filter_divisible_stakes(self, stake: Stake) -> bool:
+        """
+        Helper function for use as a filtration predicate when determining
+        what constitutes a divisible stake amongst a given iterable of stakes.
+        """
+        min_divisible_stake_value = self.economics.minimum_allowed_locked * 2
+        result = stake.value >= min_divisible_stake_value
+        return result
+
+    @property
+    def divisible_stakes(self) -> List[Stake]:
+        """chop chop"""
+        stakes = list(filter(self.__filter_divisible_stakes, self.stakes))
+        return stakes
 
     @only_me
     def divide_stake(self,
@@ -1051,6 +1095,28 @@ class Staker(NucypherTokenActor):
         receipt = self._set_winding_down(value=False)
         return receipt
 
+    def non_withdrawable_stake(self) -> NU:
+        staked_amount: NuNits = self.staking_agent.non_withdrawable_stake(staker_address=self.checksum_address)
+        return NU.from_nunits(staked_amount)
+
+    def mintable_periods(self) -> int:
+        """
+        Returns number of periods that can be rewarded in the current period. Value in range [0, 2]
+        """
+        current_period: Period = self.staking_agent.get_current_period()
+        previous_period: int = current_period - 1
+        current_committed_period: Period = self.staking_agent.get_current_committed_period(staker_address=self.checksum_address)
+        next_committed_period: Period = self.staking_agent.get_next_committed_period(staker_address=self.checksum_address)
+
+        mintable_periods: int = 0
+        if 0 < current_committed_period <= previous_period:
+            mintable_periods += 1
+        if 0 < next_committed_period <= previous_period:
+            mintable_periods += 1
+
+        return mintable_periods
+
+
     #
     # Bonding with Worker
     #
@@ -1058,12 +1124,12 @@ class Staker(NucypherTokenActor):
     @only_me
     @save_receipt
     @validate_checksum_address
-    def set_worker(self, worker_address: str) -> dict:
+    def bond_worker(self, worker_address: str) -> dict:
         if self.is_contract:
-            receipt = self.preallocation_escrow_agent.set_worker(worker_address=worker_address)
+            receipt = self.preallocation_escrow_agent.bond_worker(worker_address=worker_address)
         else:
-            receipt = self.staking_agent.set_worker(staker_address=self.checksum_address,
-                                                    worker_address=worker_address)
+            receipt = self.staking_agent.bond_worker(staker_address=self.checksum_address,
+                                                     worker_address=worker_address)
         self.__worker_address = worker_address
         return receipt
 
@@ -1076,18 +1142,18 @@ class Staker(NucypherTokenActor):
             worker_address = self.staking_agent.get_worker_from_staker(staker_address=self.checksum_address)
             self.__worker_address = worker_address
 
-        if self.__worker_address == BlockchainInterface.NULL_ADDRESS:
-            return NO_WORKER_ASSIGNED.bool_value(False)
+        if self.__worker_address == NULL_ADDRESS:
+            return NO_WORKER_BONDED.bool_value(False)
         return self.__worker_address
 
     @only_me
     @save_receipt
-    def detach_worker(self) -> dict:
+    def unbond_worker(self) -> dict:
         if self.is_contract:
             receipt = self.preallocation_escrow_agent.release_worker()
         else:
             receipt = self.staking_agent.release_worker(staker_address=self.checksum_address)
-        self.__worker_address = BlockchainInterface.NULL_ADDRESS
+        self.__worker_address = NULL_ADDRESS
         return receipt
 
     #
@@ -1108,28 +1174,30 @@ class Staker(NucypherTokenActor):
         staking_reward = self.staking_agent.calculate_staking_reward(staker_address=self.checksum_address)
         return staking_reward
 
-    def calculate_policy_reward(self) -> int:
-        policy_reward = self.policy_agent.get_reward_amount(staker_address=self.checksum_address)
-        return policy_reward
+    def calculate_policy_fee(self) -> int:
+        policy_fee = self.policy_agent.get_fee_amount(staker_address=self.checksum_address)
+        return policy_fee
 
     @only_me
     @save_receipt
     @validate_checksum_address
-    def collect_policy_reward(self, collector_address=None) -> dict:
-        """Collect rewarded ETH."""
+    def collect_policy_fee(self, collector_address=None) -> dict:
+        """Collect fees (ETH) earned since last withdrawal"""
         if self.is_contract:
-            withdraw_address = collector_address or self.beneficiary_address
-            receipt = self.preallocation_escrow_agent.collect_policy_reward(collector_address=withdraw_address)
+            if collector_address and collector_address != self.beneficiary_address:
+                raise ValueError("Policy fees must be withdrawn to the beneficiary address")
+            self.preallocation_escrow_agent.collect_policy_fee()  # TODO save receipt
+            receipt = self.preallocation_escrow_agent.withdraw_eth()
         else:
             withdraw_address = collector_address or self.checksum_address
-            receipt = self.policy_agent.collect_policy_reward(collector_address=withdraw_address,
-                                                              staker_address=self.checksum_address)
+            receipt = self.policy_agent.collect_policy_fee(collector_address=withdraw_address,
+                                                           staker_address=self.checksum_address)
         return receipt
 
     @only_me
     @save_receipt
     def collect_staking_reward(self) -> dict:
-        """Withdraw tokens rewarded for staking."""
+        """Withdraw tokens rewarded for staking"""
         if self.is_contract:
             reward_amount = self.calculate_staking_reward()
             self.log.debug(f"Withdrawing staking reward ({NU.from_nunits(reward_amount)}) to {self.checksum_address}")
@@ -1172,40 +1240,39 @@ class Staker(NucypherTokenActor):
         return receipt
 
     @property
-    def missing_confirmations(self) -> int:
+    def missing_commitments(self) -> int:
         staker_address = self.checksum_address
-        missing = self.staking_agent.get_missing_confirmations(checksum_address=staker_address)
+        missing = self.staking_agent.get_missing_commitments(checksum_address=staker_address)
         return missing
 
     @only_me
     @save_receipt
-    def set_min_reward_rate(self, min_rate: int) -> Tuple[str, str]:
-        """Public facing method for setting min reward rate."""
-        minimum, _default, maximum = self.policy_agent.get_min_reward_rate_range()
+    def set_min_fee_rate(self, min_rate: int) -> Tuple[str, str]:
+        """Public facing method for staker to set the minimum acceptable fee rate for their associated worker"""
+        minimum, _default, maximum = self.policy_agent.get_fee_rate_range()
         if min_rate < minimum or min_rate > maximum:
-            raise ValueError(f"Min reward rate  {min_rate} must be within range [{minimum}, {maximum}]")
+            raise ValueError(f"Minimum fee rate {min_rate} must fall within global fee range of [{minimum}, {maximum}]")
         if self.is_contract:
-            receipt = self.preallocation_escrow_agent.set_min_reward_rate(min_rate=min_rate)
+            receipt = self.preallocation_escrow_agent.set_min_fee_rate(min_rate=min_rate)
         else:
-            receipt = self.policy_agent.set_min_reward_rate(staker_address=self.checksum_address, min_rate=min_rate)
+            receipt = self.policy_agent.set_min_fee_rate(staker_address=self.checksum_address, min_rate=min_rate)
         return receipt
 
     @property
-    def min_reward_rate(self) -> int:
-        """Minimum acceptable reward rate"""
+    def min_fee_rate(self) -> int:
+        """Minimum fee rate that staker accepts"""
         staker_address = self.checksum_address
-        min_rate = self.policy_agent.get_min_reward_rate(staker_address)
-        return min_rate
+        min_fee = self.policy_agent.get_min_fee_rate(staker_address)
+        return min_fee
 
     @property
-    def raw_min_reward_rate(self) -> int:
-        """Minimum acceptable reward rate set by staker.
-        This's not applicable if this rate out of global range.
-        In that case default value will be used instead of raw value (see `min_reward_rate`)"""
-
+    def raw_min_fee_rate(self) -> int:
+        """Minimum acceptable fee rate set by staker for their associated worker.
+        This fee rate is only used if it falls within the global fee range.
+        If it doesn't a default fee rate is used instead of the raw value (see `min_fee_rate`)"""
         staker_address = self.checksum_address
-        min_rate = self.policy_agent.get_raw_min_reward_rate(staker_address)
-        return min_rate
+        min_fee = self.policy_agent.get_raw_min_fee_rate(staker_address)
+        return min_fee
 
 
 class Worker(NucypherTokenActor):
@@ -1219,7 +1286,7 @@ class Worker(NucypherTokenActor):
     class WorkerError(NucypherTokenActor.ActorError):
         pass
 
-    class DetachedWorker(WorkerError):
+    class UnbondedWorker(WorkerError):
         """Raised when the Worker is not bonded to a Staker in the StakingEscrow contract."""
 
     def __init__(self,
@@ -1239,10 +1306,12 @@ class Worker(NucypherTokenActor):
         self.__worker_address = worker_address
 
         # Agency
-        self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)
+        self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent,
+                                                      registry=self.registry)  # type: StakingEscrowAgent
 
         # Someday, when we have Workers for tasks other than PRE, this might instead be composed on Ursula.
-        self.policy_agent = ContractAgency.get_agent(PolicyManagerAgent, registry=self.registry)
+        self.policy_agent = ContractAgency.get_agent(PolicyManagerAgent,
+                                                     registry=self.registry)  # type: PolicyManagerAgent
 
         # Stakes
         self.__start_time = WORKER_NOT_RUNNING
@@ -1256,8 +1325,6 @@ class Worker(NucypherTokenActor):
             self.stakes.refresh()
 
             self.work_tracker = work_tracker or WorkTracker(worker=self)
-            if start_working_now:
-                self.work_tracker.start(act_now=False)
 
     def block_until_ready(self, poll_rate: int = None, timeout: int = None):
         """
@@ -1274,7 +1341,7 @@ class Worker(NucypherTokenActor):
         start = maya.now()
 
         emitter = StdoutEmitter()  # TODO: Make injectable, or embed this logic into Ursula
-        emitter.message("Waiting for bonding and funding...")
+        emitter.message("Waiting for bonding and funding...", color='yellow')
 
         funded, bonded = False, False
         while True:
@@ -1284,7 +1351,7 @@ class Worker(NucypherTokenActor):
             ether_balance = client.get_balance(self.__worker_address)
 
             # Bonding
-            if (not bonded) and (staking_address != BlockchainInterface.NULL_ADDRESS):
+            if (not bonded) and (staking_address != NULL_ADDRESS):
                 bonded = True
                 emitter.message(f"Worker is bonded to ({staking_address})!", color='green', bold=True)
 
@@ -1294,9 +1361,11 @@ class Worker(NucypherTokenActor):
                 emitter.message(f"Worker is funded with {balance} ETH!", color='green', bold=True)
 
             # Success and Escape
-            if staking_address != BlockchainInterface.NULL_ADDRESS and ether_balance:
+            if staking_address != NULL_ADDRESS and ether_balance:
                 self._checksum_address = staking_address
-                emitter.message(f"Starting services...", color='yellow', bold=True)
+
+                # TODO: #1823 - Workaround for new nickname every restart
+                self.nickname, self.nickname_metadata = nickname_from_seed(self.checksum_address)
                 break
 
             # Crash on Timeout
@@ -1304,8 +1373,8 @@ class Worker(NucypherTokenActor):
                 now = maya.now()
                 delta = now - start
                 if delta.total_seconds() >= timeout:
-                    if staking_address == BlockchainInterface.NULL_ADDRESS:
-                        raise self.DetachedWorker(f"Worker {self.__worker_address} not bonded after waiting {timeout} seconds.")
+                    if staking_address == NULL_ADDRESS:
+                        raise self.UnbondedWorker(f"Worker {self.__worker_address} not bonded after waiting {timeout} seconds.")
                     elif not ether_balance:
                         raise RuntimeError(f"Worker {self.__worker_address} has no ether after waiting {timeout} seconds.")
 
@@ -1330,21 +1399,21 @@ class Worker(NucypherTokenActor):
         return nu_balance
 
     @property
-    def last_active_period(self) -> int:
-        period = self.staking_agent.get_last_active_period(staker_address=self.checksum_address)
+    def last_committed_period(self) -> int:
+        period = self.staking_agent.get_last_committed_period(staker_address=self.checksum_address)
         return period
 
     @only_me
     @save_receipt
-    def confirm_activity(self) -> dict:
-        """For each period that the worker confirms activity, the staker is rewarded"""
-        receipt = self.staking_agent.confirm_activity(worker_address=self.__worker_address)
+    def commit_to_next_period(self) -> dict:
+        """For each period that the worker makes a commitment, the staker is rewarded"""
+        receipt = self.staking_agent.commit_to_next_period(worker_address=self.__worker_address)
         return receipt
 
     @property
-    def missing_confirmations(self) -> int:
+    def missing_commitments(self) -> int:
         staker_address = self.checksum_address
-        missing = self.staking_agent.get_missing_confirmations(checksum_address=staker_address)
+        missing = self.staking_agent.get_missing_commitments(checksum_address=staker_address)
         return missing
 
 
@@ -1374,7 +1443,7 @@ class BlockchainPolicyAuthor(NucypherTokenActor):
 
     @property
     def default_rate(self):
-        _minimum, default, _maximum = self.policy_agent.get_min_reward_rate_range()
+        _minimum, default, _maximum = self.policy_agent.get_fee_rate_range()
         return default
 
     def generate_policy_parameters(self,
@@ -1403,7 +1472,7 @@ class BlockchainPolicyAuthor(NucypherTokenActor):
                                             start_of_period=True)
             expiration -= 1  # Get the last second of the target period
         else:
-            now = self.staking_agent.blockchain.w3.eth.getBlock(block_identifier='latest').timestamp
+            now = self.staking_agent.blockchain.get_blocktime()
             duration_periods = calculate_period_duration(now=maya.MayaDT(now),
                                                          future_time=expiration,
                                                          seconds_per_period=self.economics.seconds_per_period)
@@ -1465,69 +1534,83 @@ class Investigator(NucypherTokenActor):
         return receipt
 
 
+class Wallet:
+    """
+    Account management abstraction on top of blockchain providers and external signers
+    """
+    class UnknownAccount(KeyError):
+        pass
+
+    def __init__(self,
+                 client_addresses: set = None,
+                 provider_uri: str = None,
+                 signer=None):
+
+        self.__client_accounts = list()
+        self.__transacting_powers = dict()
+
+        # Blockchain
+        self.blockchain = BlockchainInterfaceFactory.get_interface(provider_uri)
+        self.__signer = signer
+
+        self.__get_accounts()
+        if client_addresses:
+            self.__client_accounts.extend([a for a in client_addresses if a not in self.__client_accounts])
+
+    @validate_checksum_address
+    def __contains__(self, checksum_address: str) -> bool:
+        return bool(checksum_address in self.accounts)
+
+    @property
+    def active_account(self) -> str:
+        return self.blockchain.transacting_power.account
+
+    def __get_accounts(self) -> None:
+        if self.__signer:
+            signer_accounts = self.__signer.accounts
+            self.__client_accounts.extend([a for a in signer_accounts if a not in self.__client_accounts])
+        client_accounts = self.blockchain.client.accounts  # Accounts via connected provider
+        self.__client_accounts.extend([a for a in client_accounts if a not in self.__client_accounts])
+
+    @property
+    def accounts(self) -> Tuple:
+        return tuple(self.__client_accounts)
+
+    @validate_checksum_address
+    def activate_account(self,
+                         checksum_address: str,
+                         signer: Optional[Signer] = None,
+                         password: Optional[str] = None
+                         ) -> None:
+
+        if checksum_address not in self:
+            self.__signer = signer or Web3Signer(client=self.blockchain.client)
+            if isinstance(self.__signer, KeystoreSigner):
+                raise BaseActor.ActorError(f"Staking operations are not permitted while using a local keystore signer.")
+            self.__get_accounts()
+            if checksum_address not in self:
+                raise self.UnknownAccount
+        try:
+            transacting_power = self.__transacting_powers[checksum_address]
+        except KeyError:
+            transacting_power = TransactingPower(signer=self.__signer or Web3Signer(client=self.blockchain.client),
+                                                 password=password,
+                                                 account=checksum_address)
+            self.__transacting_powers[checksum_address] = transacting_power
+        transacting_power.activate(password=password)
+
+    def eth_balance(self, account: str) -> int:
+        return self.blockchain.client.get_balance(account)
+
+    def token_balance(self, account: str, registry: BaseContractRegistry) -> int:
+        token_agent = ContractAgency.get_agent(NucypherTokenAgent, registry)  # type: NucypherTokenAgent
+        return token_agent.get_balance(account)
+
+
 class StakeHolder(Staker):
 
     banner = STAKEHOLDER_BANNER
 
-    class StakingWallet:
-
-        class UnknownAccount(KeyError):
-            pass
-
-        def __init__(self,
-                     registry: BaseContractRegistry,
-                     checksum_addresses: set = None):
-
-            # Wallet
-            self.__accounts = set()  # Note: Account index is meaningless here
-            self.__transacting_powers = dict()
-
-            # Blockchain
-            self.registry = registry
-            self.blockchain = BlockchainInterfaceFactory.get_interface()
-            self.token_agent = ContractAgency.get_agent(NucypherTokenAgent, registry=self.registry)
-
-            self.__get_accounts()
-            if checksum_addresses:
-                self.__accounts.update(checksum_addresses)
-
-        @validate_checksum_address
-        def __contains__(self, checksum_address: str) -> bool:
-            return bool(checksum_address in self.__accounts)
-
-        @property
-        def active_account(self) -> str:
-            return self.blockchain.transacting_power.account
-
-        def __get_accounts(self) -> None:
-            accounts = self.blockchain.client.accounts
-            self.__accounts.update(accounts)
-
-        @property
-        def accounts(self) -> set:
-            return self.__accounts
-
-        @validate_checksum_address
-        def activate_account(self, checksum_address: str, password: str = None) -> None:
-            if checksum_address not in self:
-                self.__get_accounts()
-                if checksum_address not in self:
-                    raise self.UnknownAccount
-            try:
-                transacting_power = self.__transacting_powers[checksum_address]
-            except KeyError:
-                transacting_power = TransactingPower(password=password, account=checksum_address)
-                self.__transacting_powers[checksum_address] = transacting_power
-            transacting_power.activate(password=password)
-
-        @property
-        def balances(self) -> Dict:
-            balances = dict()
-            for account in self.accounts:
-                funds = {'ETH': self.blockchain.client.get_balance(account),
-                         'NU': self.token_agent.get_balance(account)}
-                balances.update({account: funds})
-            return balances
 
     #
     # StakeHolder
@@ -1537,6 +1620,7 @@ class StakeHolder(Staker):
                  is_me: bool = True,
                  initial_address: str = None,
                  checksum_addresses: set = None,
+                 signer: Signer = None,
                  password: str = None,
                  *args, **kwargs):
 
@@ -1546,14 +1630,14 @@ class StakeHolder(Staker):
         self.log = Logger(f"stakeholder")
 
         # Wallet
-        self.wallet = self.StakingWallet(registry=self.registry, checksum_addresses=checksum_addresses)
+        self.wallet = Wallet(client_addresses=checksum_addresses, signer=signer)
         if initial_address:
             # If an initial address was passed,
             # it is safe to understand that it has already been used at a higher level.
             if initial_address not in self.wallet:
                 message = f"Account {initial_address} is not known by this Ethereum client. Is it a HW account? " \
                           f"If so, make sure that your device is plugged in and you use the --hw-wallet flag."
-                raise self.StakingWallet.UnknownAccount(message)
+                raise Wallet.UnknownAccount(message)
             self.assimilate(checksum_address=initial_address, password=password)
 
     @validate_checksum_address
@@ -1567,7 +1651,7 @@ class StakeHolder(Staker):
         if self.individual_allocation:
             if checksum_address != self.individual_allocation.beneficiary_address:
                 raise ValueError(f"Beneficiary {self.individual_allocation.beneficiary_address} in individual "
-                                 f"allocation doesn't match this checksum address ({checksum_address})")
+                                 f"allocations does not match this checksum address ({checksum_address})")
             staking_address = self.individual_allocation.contract_address
             self.beneficiary_address = self.individual_allocation.beneficiary_address
             self.preallocation_escrow_agent = PreallocationEscrowAgent(registry=self.registry,
@@ -1633,86 +1717,215 @@ class Bidder(NucypherTokenActor):
     class BiddingIsOpen(BidderError):
         pass
 
-    class BidingIsClosed(BidderError):
+    class BiddingIsClosed(BidderError):
+        pass
+
+    class CancellationWindowIsOpen(BidderError):
+        pass
+
+    class CancellationWindowIsClosed(BidderError):
+        pass
+
+    class ClaimError(BidderError):
+        pass
+
+    class WhaleError(BidderError):
         pass
 
     @validate_checksum_address
     def __init__(self,
                  checksum_address: str,
-                 is_transacting: bool = True,
+                 transacting: bool = True,
+                 signer: Signer = None,
                  client_password: str = None,
                  *args, **kwargs):
+
         super().__init__(checksum_address=checksum_address, *args, **kwargs)
-        self.worklock_agent = ContractAgency.get_agent(WorkLockAgent, registry=self.registry)
-        self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)
+        self.log = Logger(f"WorkLockBidder")
+        self.worklock_agent = ContractAgency.get_agent(WorkLockAgent, registry=self.registry)  # type: WorkLockAgent
+        self.staking_agent = ContractAgency.get_agent(StakingEscrowAgent, registry=self.registry)  # type: StakingEscrowAgent
         self.economics = EconomicsFactory.get_economics(registry=self.registry)
 
-        if is_transacting:
-            self.transacting_power = TransactingPower(password=client_password, account=checksum_address)
+        if transacting:
+            self.transacting_power = TransactingPower(signer=signer,
+                                                      password=client_password,
+                                                      account=checksum_address)
             self.transacting_power.activate()
 
-    def _ensure_bidding_is_open(self) -> None:
-        highest_block = self.worklock_agent.blockchain.w3.eth.getBlock('latest')
-        now = highest_block['timestamp']
-        start = self.worklock_agent.start_date
-        end = self.worklock_agent.end_date
+        self._all_bonus_bidders = None
+
+    def ensure_bidding_is_open(self, message: str = None) -> None:
+        now = self.worklock_agent.blockchain.get_blocktime()
+        start = self.worklock_agent.start_bidding_date
+        end = self.worklock_agent.end_bidding_date
         if now < start:
-            raise self.BiddingIsClosed(f'Bidding does not open until {maya.MayaDT(start).slang_date()}')
-        if now > end:
-            raise self.BiddingIsClosed(f'Bidding closed at {maya.MayaDT(end).slang_date()}')
+            message = message or f'Bidding does not open until {maya.MayaDT(start).slang_date()}'
+            raise self.BiddingIsClosed(message)
+        if now >= end:
+            message = message or f'Bidding closed at {maya.MayaDT(end).slang_date()}'
+            raise self.BiddingIsClosed(message)
 
     def _ensure_bidding_is_closed(self, message: str = None) -> None:
-        highest_block = self.worklock_agent.blockchain.w3.eth.getBlock('latest')
-        now = highest_block['timestamp']
-        end = self.worklock_agent.end_date
+        now = self.worklock_agent.blockchain.get_blocktime()
+        end = self.worklock_agent.end_bidding_date
         if now < end:
-            message = message or f"Bidding does not close until {end}"
+            message = message or f"Bidding does not close until {maya.MayaDT(end).slang_date()}"
             raise self.BiddingIsOpen(message)
+
+    def _ensure_cancellation_window(self, ensure_closed: bool = True, message: str = None) -> None:
+        now = self.worklock_agent.blockchain.get_blocktime()
+        end = self.worklock_agent.end_cancellation_date
+        if ensure_closed and now < end:
+            message = message or f"Operation cannot be performed while the cancellation window is still open " \
+                                 f"(closes at {maya.MayaDT(end).slang_date()})."
+            raise self.CancellationWindowIsOpen(message)
+        elif not ensure_closed and now >= end:
+            message = message or f"Operation is allowed only while the cancellation window is open " \
+                                 f"(closed at {maya.MayaDT(end).slang_date()})."
+            raise self.CancellationWindowIsClosed(message)
 
     #
     # Transactions
     #
 
     def place_bid(self, value: int) -> dict:
-        self._ensure_bidding_is_open()
+        self.ensure_bidding_is_open()
+        minimum = self.worklock_agent.minimum_allowed_bid
+        if not self.get_deposited_eth and value < minimum:
+            raise self.BidderError(f"{prettify_eth_amount(value)} is too small a value for bidding; "
+                                   f"bid must be at least {prettify_eth_amount(minimum)}")
         receipt = self.worklock_agent.bid(checksum_address=self.checksum_address, value=value)
         return receipt
 
     def claim(self) -> dict:
 
-        # Require the Bidding window is closed
-        end = self.worklock_agent.end_date
-        error = f"Claims cannot be placed while the bidding window is still open (closes at {end})."
-        self._ensure_bidding_is_closed(message=error)
+        # Require the cancellation window is closed
+        self._ensure_cancellation_window(ensure_closed=True)
+
+        if not self.worklock_agent.is_claiming_available():
+            raise self.ClaimError(f"Claiming is not available yet")
 
         # Ensure the claim was not already placed
-        if self._has_claimed:
-            raise self.BidderError(f"Bidder {self.checksum_address} already placed a claim.")
+        if self.has_claimed:
+            raise self.ClaimError(f"Bidder {self.checksum_address} already placed a claim.")
 
         # Require an active bid
         if not self.get_deposited_eth:
-            raise self.BidderError(f"No claims available for {self.checksum_address}")
-
-        # Ensure the claim is at least large enough for min. stake
-        minimum = self.economics.minimum_allowed_locked
-        if self.available_claim < minimum:
-            raise ValueError(f"Claim is too small. Claim amount must be worth at least {NU.from_nunits(minimum)})")
+            raise self.ClaimError(f"No bids available for {self.checksum_address}")
 
         receipt = self.worklock_agent.claim(checksum_address=self.checksum_address)
         return receipt
 
     def cancel_bid(self) -> dict:
+        self._ensure_cancellation_window(ensure_closed=False)
 
         # Require an active bid
         if not self.get_deposited_eth:
             self.BidderError(f"No bids available for {self.checksum_address}")
 
-        # Ensure the claim was not already placed
-        if self._has_claimed:
-            raise self.BidderError(f"Bidder {self.checksum_address} already placed a claim.")
-
         receipt = self.worklock_agent.cancel_bid(checksum_address=self.checksum_address)
         return receipt
+
+    def _get_max_bonus_bid_from_max_stake(self) -> int:
+        """Returns maximum allowed bid calculated from maximum allowed locked tokens"""
+        max_bonus_tokens = self.economics.maximum_allowed_locked - self.economics.minimum_allowed_locked
+        bonus_eth_supply = sum(self._all_bonus_bidders.values()) if self._all_bonus_bidders else self.worklock_agent.get_bonus_eth_supply()
+        bonus_worklock_supply = self.worklock_agent.get_bonus_lot_value()
+        max_bonus_bid = max_bonus_tokens * bonus_eth_supply // bonus_worklock_supply
+        return max_bonus_bid
+
+    def get_whales(self, force_read: bool = False) -> Dict[str, int]:
+        """Returns all worklock bidders over the whale threshold as a dictionary of addresses and bonus bid values."""
+        max_bonus_bid_from_max_stake = self._get_max_bonus_bid_from_max_stake()
+
+        bidders = dict()
+        for bidder, bid in self._get_all_bonus_bidders(force_read).items():
+            if bid > max_bonus_bid_from_max_stake:
+                bidders[bidder] = bid
+        return bidders
+
+    def _get_all_bonus_bidders(self, force_read: bool = False) -> dict:
+        if not force_read and self._all_bonus_bidders:
+            return self._all_bonus_bidders
+
+        bidders = self.worklock_agent.get_bidders()
+        min_bid = self.economics.worklock_min_allowed_bid
+
+        self._all_bonus_bidders = dict()
+        for bidder in bidders:
+            bid = self.worklock_agent.get_deposited_eth(bidder)
+            if bid > min_bid:
+                self._all_bonus_bidders[bidder] = bid - min_bid
+        return self._all_bonus_bidders
+
+    def _reduce_bids(self, whales: dict):
+
+        min_whale_bonus_bid = min(whales.values())
+        max_whale_bonus_bid = max(whales.values())
+
+        # first step - align at a minimum bid
+        if min_whale_bonus_bid != max_whale_bonus_bid:
+            whales = dict.fromkeys(whales.keys(), min_whale_bonus_bid)
+            self._all_bonus_bidders.update(whales)
+
+        bonus_eth_supply = sum(self._all_bonus_bidders.values())
+        bonus_worklock_supply = self.worklock_agent.get_bonus_lot_value()
+        max_bonus_tokens = self.economics.maximum_allowed_locked - self.economics.minimum_allowed_locked
+        if (min_whale_bonus_bid * bonus_worklock_supply) // bonus_eth_supply <= max_bonus_tokens:
+            raise self.WhaleError(f"At least one of bidders {whales} has allowable bid")
+
+        a = min_whale_bonus_bid * bonus_worklock_supply - max_bonus_tokens * bonus_eth_supply
+        b = bonus_worklock_supply - max_bonus_tokens * len(whales)
+        refund = -(-a//b)  # div ceil
+        min_whale_bonus_bid -= refund
+        whales = dict.fromkeys(whales.keys(), min_whale_bonus_bid)
+        self._all_bonus_bidders.update(whales)
+
+        return whales
+
+    def force_refund(self) -> dict:
+        self._ensure_cancellation_window(ensure_closed=True)
+
+        whales = self.get_whales()
+        if not whales:
+            raise self.WhaleError(f"Force refund aborted: No whales detected and all bids qualify for claims.")
+
+        new_whales = whales.copy()
+        while new_whales:
+            whales.update(new_whales)
+            whales = self._reduce_bids(whales)
+            new_whales = self.get_whales()
+
+        receipt = self.worklock_agent.force_refund(checksum_address=self.checksum_address,
+                                                   addresses=list(whales.keys()))
+
+        if self.get_whales(force_read=True):
+            raise RuntimeError(f"Internal error: offline simulation differs from transaction results")
+        return receipt
+
+    # TODO better control: max iterations, interactive mode
+    def verify_bidding_correctness(self, gas_limit: int) -> dict:
+        self._ensure_cancellation_window(ensure_closed=True)
+
+        if self.worklock_agent.bidders_checked():
+            raise self.BidderError(f"Check was already done")
+
+        whales = self.get_whales()
+        if whales:
+            raise self.WhaleError(f"Some bidders have bids that are too high: {whales}")
+
+        self.log.debug(f"Starting bidding verification. Next bidder to check: {self.worklock_agent.next_bidder_to_check()}")
+
+        receipts = dict()
+        iteration = 1
+        while not self.worklock_agent.bidders_checked():
+            self.transacting_power.activate()  # Refresh TransactingPower
+            receipt = self.worklock_agent.verify_bidding_correctness(checksum_address=self.checksum_address,
+                                                                     gas_limit=gas_limit)
+            self.log.debug(f"Iteration {iteration}. Next bidder to check: {self.worklock_agent.next_bidder_to_check()}")
+            receipts[iteration] = receipt
+            iteration += 1
+        return receipts
 
     def refund_deposit(self) -> dict:
         """Refund ethers for completed work"""
@@ -1721,18 +1934,25 @@ class Bidder(NucypherTokenActor):
         receipt = self.worklock_agent.refund(checksum_address=self.checksum_address)
         return receipt
 
+    def withdraw_compensation(self) -> dict:
+        """Withdraw compensation after force refund"""
+        if not self.available_compensation:
+            raise self.BidderError(f'There is no compensation available for {self.checksum_address}; '
+                                   f'Did you mean to call "refund"?')
+        receipt = self.worklock_agent.withdraw_compensation(checksum_address=self.checksum_address)
+        return receipt
+
     #
     # Calls
     #
 
     @property
-    def get_deposited_eth(self, denomination: str = 'wei') -> int:
+    def get_deposited_eth(self) -> int:
         bid = self.worklock_agent.get_deposited_eth(checksum_address=self.checksum_address)
-        ether_bid = Web3.toWei(bid, denomination)
-        return ether_bid
+        return bid
 
     @property
-    def _has_claimed(self) -> bool:
+    def has_claimed(self) -> bool:
         has_claimed = self.worklock_agent.check_claim(self.checksum_address)
         return has_claimed
 
@@ -1746,7 +1966,7 @@ class Bidder(NucypherTokenActor):
     def remaining_work(self) -> int:
         try:
             work = self.worklock_agent.get_remaining_work(checksum_address=self.checksum_address)
-        except (TransactionFailed, ValueError):  # TODO: Is his how we want to handle thid?
+        except (TestTransactionFailed, ValidationError, ValueError):  # TODO: 1950
             work = 0
         return work
 
@@ -1757,12 +1977,13 @@ class Bidder(NucypherTokenActor):
 
     @property
     def available_refund(self) -> int:
-        refund_eth = self.worklock_agent.get_available_refund(completed_work=self.completed_work)
-        bid = self.get_deposited_eth
-        if refund_eth > bid:
-            # Overachiever: This bidder has worked more than required.
-            refund_eth = bid
+        refund_eth = self.worklock_agent.get_available_refund(checksum_address=self.checksum_address)
         return refund_eth
+
+    @property
+    def available_compensation(self) -> int:
+        compensation_eth = self.worklock_agent.get_available_compensation(checksum_address=self.checksum_address)
+        return compensation_eth
 
     @property
     def available_claim(self) -> int:

@@ -14,13 +14,14 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
+
+
 from bytestring_splitter import BytestringSplitter
 from umbral.config import default_params
 from umbral.keys import UmbralPublicKey
 from umbral.pre import Capsule
 
-from nucypher.crypto.constants import PUBLIC_KEY_LENGTH, CAPSULE_LENGTH
+from nucypher.crypto.constants import CAPSULE_LENGTH, PUBLIC_KEY_LENGTH
 
 key_splitter = BytestringSplitter((UmbralPublicKey, PUBLIC_KEY_LENGTH))
 capsule_splitter = BytestringSplitter((Capsule, CAPSULE_LENGTH, {"params": default_params()}))
-

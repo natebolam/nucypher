@@ -15,8 +15,11 @@ You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-
 from __future__ import absolute_import, division, print_function
+
+"""
+WARNING: Do not modify this file.
+"""
 
 __all__ = [
     "__title__", "__summary__", "__version__", "__author__", "__email__", "__license__", "__copyright__", "__url__"
@@ -28,7 +31,7 @@ __url__ = "https://github.com/nucypher/nucypher"
 
 __summary__ = 'A proxy re-encryption network to empower privacy in decentralized systems.'
 
-__version__ = "2.0.0-beta.7"
+__version__ = "2.1.0-beta.12"
 
 __author__ = "NuCypher"
 

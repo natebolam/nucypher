@@ -1,21 +1,37 @@
-import inspect
-import json
-from abc import ABC, abstractmethod
-from json import JSONDecodeError
-from typing import Callable
+"""
+ This file is part of nucypher.
 
+ nucypher is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ nucypher is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Affero General Public License for more details.
+
+ You should have received a copy of the GNU Affero General Public License
+ along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
+import json
+from json import JSONDecodeError
+
+import inspect
 import maya
-from flask import Response, Flask
+from abc import ABC, abstractmethod
+from flask import Flask, Response
 from hendrix.deploy.base import HendrixDeploy
-from marshmallow import Schema
 from twisted.internet import reactor, stdio
 from twisted.logger import Logger
 
-from nucypher.characters.control.emitters import StdoutEmitter, WebEmitter, JSONRPCStdoutEmitter
+from nucypher.characters.control.emitters import JSONRPCStdoutEmitter, StdoutEmitter, WebEmitter
 from nucypher.characters.control.interfaces import CharacterPublicInterface
 from nucypher.characters.control.specifications.exceptions import SpecificationError
 from nucypher.cli.processes import JSONRPCLineReceiver
-from nucypher.utilities.controllers import JSONRPCTestClient
+from nucypher.config.constants import MAX_UPLOAD_CONTENT_LENGTH
+from nucypher.exceptions import DevelopmentInstallationRequired
 
 
 class CharacterControllerBase(ABC):
@@ -44,7 +60,6 @@ class CharacterControllerBase(ABC):
         method = getattr(self.interface, action, None)
         serializer = method._schema
         params = serializer.load(request) # input validation will occur here.
-
         response = method(**params)  # < ---- INLET
 
         response_data = serializer.dump(response)
@@ -123,10 +138,11 @@ class CLIController(CharacterControlServer):
     def test_client(self):
         return
 
-    def handle_request(self, method_name, request):
+    def handle_request(self, method_name, request) -> dict:
         start = maya.now()
         response = self._perform_action(action=method_name, request=request)
-        return self.emitter.ipc(response=response, request_id=start.epoch, duration=maya.now() - start)
+        self.emitter.ipc(response=response, request_id=start.epoch, duration=maya.now() - start)
+        return response
 
 
 class JSONRPCController(CharacterControlServer):
@@ -137,7 +153,12 @@ class JSONRPCController(CharacterControlServer):
         _transport = self.make_control_transport()
         reactor.run()  # < ------ Blocking Call (Reactor)
 
-    def test_client(self) -> JSONRPCTestClient:
+    def test_client(self):
+        try:
+            from tests.utils.controllers import JSONRPCTestClient
+        except ImportError:
+            raise DevelopmentInstallationRequired(importable_name='tests.utils.controllers.JSONRPCTestClient')
+
         test_client = JSONRPCTestClient(rpc_controller=self)
         return test_client
 
@@ -248,6 +269,7 @@ class WebController(CharacterControlServer):
     def make_control_transport(self):
 
         self._transport = Flask(self.app_name)
+        self._transport.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_CONTENT_LENGTH
 
         # Return FlaskApp decorator
         return self._transport

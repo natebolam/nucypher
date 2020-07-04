@@ -15,16 +15,19 @@ You should have received a copy of the GNU Affero General Public License
 along with nucypher.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import os
-
 import click
+import os
 from constant_sorrow.constants import NO_BLOCKCHAIN_CONNECTION, NO_PASSWORD
 
-from nucypher.characters.banners import ALICE_BANNER
+from nucypher.blockchain.eth.signers import ClefSigner
+from nucypher.characters.control.emitters import StdoutEmitter
 from nucypher.characters.control.interfaces import AliceInterface
-from nucypher.cli import actions, painting
-from nucypher.cli.actions import get_nucypher_password, select_client_account, get_client_password, \
-    get_or_update_configuration
+from nucypher.cli.actions.auth import get_client_password, get_nucypher_password
+from nucypher.cli.actions.configure import (
+    destroy_configuration,
+    handle_missing_configuration_file, get_or_update_configuration
+)
+from nucypher.cli.actions.select import select_client_account, select_config_file
 from nucypher.cli.commands.deploy import option_gas_strategy
 from nucypher.cli.config import group_general_config
 from nucypher.cli.options import (
@@ -48,13 +51,17 @@ from nucypher.cli.options import (
     option_poa,
     option_provider_uri,
     option_registry_filepath,
-    option_teacher_uri,
-    option_rate)
+    option_signer_uri,
+    option_teacher_uri
+)
+from nucypher.cli.painting.help import paint_new_installation_help
+from nucypher.cli.processes import get_geth_provider_process
 from nucypher.cli.types import EIP55_CHECKSUM_ADDRESS
+from nucypher.cli.utils import make_cli_character, setup_emitter
 from nucypher.config.characters import AliceConfiguration
-from nucypher.config.constants import NUCYPHER_ENVVAR_ALICE_ETH_PASSWORD
+from nucypher.config.constants import NUCYPHER_ENVVAR_ALICE_ETH_PASSWORD, TEMPORARY_DOMAIN
 from nucypher.config.keyring import NucypherKeyring
-from nucypher.utilities.sandbox.constants import TEMPORARY_DOMAIN
+from nucypher.network.middleware import RestMiddleware
 
 option_bob_verifying_key = click.option(
     '--bob-verifying-key',
@@ -71,8 +78,19 @@ class AliceConfigOptions:
 
     __option_name__ = 'config_options'
 
-    def __init__(self, dev, network, provider_uri, geth, federated_only, discovery_port,
-                 pay_with, registry_filepath, middleware, gas_strategy):
+    def __init__(self,
+                 dev: bool,
+                 network: str,
+                 provider_uri: str,
+                 geth: bool,
+                 federated_only: bool,
+                 discovery_port: int,
+                 pay_with: str,
+                 registry_filepath: str,
+                 middleware: RestMiddleware,
+                 gas_strategy: str,
+                 signer_uri: str
+                 ):
 
         if federated_only and geth:
             raise click.BadOptionUsage(
@@ -82,12 +100,13 @@ class AliceConfigOptions:
         # Managed Ethereum Client
         eth_node = NO_BLOCKCHAIN_CONNECTION
         if geth:
-            eth_node = actions.get_provider_process()
+            eth_node = get_geth_provider_process()
             provider_uri = eth_node.provider_uri(scheme='file')
 
         self.dev = dev
         self.domains = {network} if network else None
         self.provider_uri = provider_uri
+        self.signer_uri = signer_uri
         self.gas_strategy = gas_strategy
         self.geth = geth
         self.federated_only = federated_only
@@ -114,6 +133,7 @@ class AliceConfigOptions:
                 domains={TEMPORARY_DOMAIN},
                 provider_process=self.eth_node,
                 provider_uri=self.provider_uri,
+                signer_uri=self.signer_uri,
                 gas_strategy=self.gas_strategy,
                 federated_only=True)
 
@@ -126,13 +146,14 @@ class AliceConfigOptions:
                     domains=self.domains,
                     provider_process=self.eth_node,
                     provider_uri=self.provider_uri,
+                    signer_uri=self.signer_uri,
                     gas_strategy=self.gas_strategy,
                     filepath=config_file,
                     rest_port=self.discovery_port,
                     checksum_address=self.pay_with,
                     registry_filepath=self.registry_filepath)
             except FileNotFoundError:
-                return actions.handle_missing_configuration_file(
+                return handle_missing_configuration_file(
                     character_config_class=AliceConfiguration,
                     config_file=config_file
                 )
@@ -141,8 +162,9 @@ class AliceConfigOptions:
 group_config_options = group_options(
     AliceConfigOptions,
     dev=option_dev,
-    network=option_network,
+    network=option_network(),
     provider_uri=option_provider_uri(),
+    signer_uri=option_signer_uri,
     gas_strategy=option_gas_strategy,
     geth=option_geth,
     federated_only=option_federated_only,
@@ -157,7 +179,7 @@ class AliceFullConfigOptions:
 
     __option_name__ = 'full_config_options'
 
-    def __init__(self, config_options, poa, light, m, n, duration_periods):
+    def __init__(self, config_options, poa: bool, light: bool, m: int, n: int, duration_periods: int):
         self.config_options = config_options
         self.poa = poa
         self.light = light
@@ -165,7 +187,7 @@ class AliceFullConfigOptions:
         self.n = n
         self.duration_periods = duration_periods
 
-    def generate_config(self, emitter, config_root):
+    def generate_config(self, emitter: StdoutEmitter, config_root: str) -> AliceConfiguration:
 
         opts = self.config_options
 
@@ -179,7 +201,10 @@ class AliceFullConfigOptions:
 
         pay_with = opts.pay_with
         if not pay_with and not opts.federated_only:
-            pay_with = select_client_account(emitter=emitter, provider_uri=opts.provider_uri, show_balances=False)
+            pay_with = select_client_account(emitter=emitter,
+                                             provider_uri=opts.provider_uri,
+                                             signer_uri=opts.signer_uri,
+                                             show_eth_balance=True)
 
         return AliceConfiguration.generate(
             password=get_nucypher_password(confirm=True),
@@ -188,6 +213,7 @@ class AliceFullConfigOptions:
             domains=opts.domains,
             federated_only=opts.federated_only,
             provider_uri=opts.provider_uri,
+            signer_uri=opts.signer_uri,
             provider_process=opts.eth_node,
             registry_filepath=opts.registry_filepath,
             poa=self.poa,
@@ -202,6 +228,7 @@ class AliceFullConfigOptions:
                        domains=opts.domains,
                        federated_only=opts.federated_only,
                        provider_uri=opts.provider_uri,
+                       signer_uri=opts.signer_uri,
                        registry_filepath=opts.registry_filepath,
                        poa=self.poa,
                        light=self.light,
@@ -220,15 +247,15 @@ group_full_config_options = group_options(
     light=option_light,
     m=option_m,
     n=option_n,
-    duration_periods=option_duration_periods,
-    )
+    duration_periods=option_duration_periods
+)
 
 
 class AliceCharacterOptions:
 
     __option_name__ = 'character_options'
 
-    def __init__(self, config_options, hw_wallet, teacher_uri, min_stake):
+    def __init__(self, config_options: AliceConfigOptions, hw_wallet: bool, teacher_uri: str, min_stake: int):
         self.config_options = config_options
         self.hw_wallet = hw_wallet
         self.teacher_uri = teacher_uri
@@ -239,7 +266,8 @@ class AliceCharacterOptions:
         config = self.config_options.create_config(emitter, config_file)
 
         client_password = None
-        eth_password_is_needed = not config.federated_only and not self.hw_wallet and not config.dev_mode
+        is_clef = ClefSigner.is_valid_clef_uri(self.config_options.signer_uri)
+        eth_password_is_needed = not config.federated_only and not self.hw_wallet and not config.dev_mode and not is_clef
         if eth_password_is_needed:
             if json_ipc:
                 client_password = os.environ.get(NUCYPHER_ENVVAR_ALICE_ETH_PASSWORD, NO_PASSWORD)
@@ -251,14 +279,14 @@ class AliceCharacterOptions:
                                                       envvar=NUCYPHER_ENVVAR_ALICE_ETH_PASSWORD)
 
         try:
-            ALICE = actions.make_cli_character(character_config=config,
-                                               emitter=emitter,
-                                               unlock_keyring=not config.dev_mode,
-                                               teacher_uri=self.teacher_uri,
-                                               min_stake=self.min_stake,
-                                               client_password=client_password,
-                                               load_preferred_teachers=load_seednodes,
-                                               start_learning_now=load_seednodes)
+            ALICE = make_cli_character(character_config=config,
+                                       emitter=emitter,
+                                       unlock_keyring=not config.dev_mode,
+                                       teacher_uri=self.teacher_uri,
+                                       min_stake=self.min_stake,
+                                       client_password=client_password,
+                                       load_preferred_teachers=load_seednodes,
+                                       start_learning_now=load_seednodes)
 
             return ALICE
         except NucypherKeyring.AuthenticationFailed as e:
@@ -272,15 +300,12 @@ group_character_options = group_options(
     hw_wallet=option_hw_wallet,
     teacher_uri=option_teacher_uri,
     min_stake=option_min_stake,
-    )
+)
 
 
 @click.group()
 def alice():
-    """
-    "Alice the Policy Authority" management commands.
-    """
-    pass
+    """"Alice the Policy Authority" management commands."""
 
 
 @alice.command()
@@ -288,14 +313,12 @@ def alice():
 @option_config_root
 @group_general_config
 def init(general_config, full_config_options, config_root):
-    """
-    Create a brand new persistent Alice.
-    """
-    emitter = _setup_emitter(general_config)
+    """Create a brand new persistent Alice."""
+    emitter = setup_emitter(general_config)
     if not config_root:
         config_root = general_config.config_root
     new_alice_config = full_config_options.generate_config(emitter, config_root)
-    painting.paint_new_installation_help(emitter, new_configuration=new_alice_config)
+    paint_new_installation_help(emitter, new_configuration=new_alice_config)
 
 
 @alice.command()
@@ -303,16 +326,17 @@ def init(general_config, full_config_options, config_root):
 @group_general_config
 @group_full_config_options
 def config(general_config, config_file, full_config_options):
-    """
-    View and optionally update existing Alice's configuration.
-    """
-    emitter = _setup_emitter(general_config)
-    configuration_file_location = config_file or AliceConfiguration.default_filepath()
-    emitter.echo(f"Alice Configuration {configuration_file_location} \n {'='*55}")
-    return get_or_update_configuration(emitter=emitter,
-                                       config_class=AliceConfiguration,
-                                       filepath=configuration_file_location,
-                                       config_options=full_config_options)
+    """View and optionally update existing Alice's configuration."""
+    emitter = setup_emitter(general_config)
+    if not config_file:
+        config_file = select_config_file(emitter=emitter,
+                                         checksum_address=full_config_options.config_options.pay_with,
+                                         config_class=AliceConfiguration)
+    updates = full_config_options.get_updates()
+    get_or_update_configuration(emitter=emitter,
+                                config_class=AliceConfiguration,
+                                filepath=config_file,
+                                updates=updates)
 
 
 @alice.command()
@@ -321,12 +345,10 @@ def config(general_config, config_file, full_config_options):
 @option_force
 @group_general_config
 def destroy(general_config, config_options, config_file, force):
-    """
-    Delete existing Alice's configuration.
-    """
-    emitter = _setup_emitter(general_config)
+    """Delete existing Alice's configuration."""
+    emitter = setup_emitter(general_config)
     alice_config = config_options.create_config(emitter, config_file)
-    return actions.destroy_configuration(emitter, character_config=alice_config, force=force)
+    destroy_configuration(emitter, character_config=alice_config, force=force)
 
 
 @alice.command()
@@ -336,10 +358,10 @@ def destroy(general_config, config_options, config_file, force):
 @group_general_config
 @group_character_options
 def run(general_config, character_options, config_file, controller_port, dry_run):
-    """
-    Start Alice's web controller.
-    """
-    emitter = _setup_emitter(general_config)
+    """Start Alice's web controller."""
+
+    # Setup
+    emitter = setup_emitter(general_config)
     ALICE = character_options.create_character(emitter, config_file, general_config.json_ipc)
 
     try:
@@ -372,10 +394,8 @@ def run(general_config, character_options, config_file, controller_port, dry_run
 @option_config_file
 @group_general_config
 def public_keys(general_config, character_options, config_file):
-    """
-    Obtain Alice's public verification and encryption keys.
-    """
-    emitter = _setup_emitter(general_config)
+    """Obtain Alice's public verification and encryption keys."""
+    emitter = setup_emitter(general_config)
     ALICE = character_options.create_character(emitter, config_file, general_config.json_ipc, load_seednodes=False)
     response = ALICE.controller.public_keys()
     return response
@@ -387,10 +407,8 @@ def public_keys(general_config, character_options, config_file):
 @option_config_file
 @group_general_config
 def derive_policy_pubkey(general_config, label, character_options, config_file):
-    """
-    Get a policy public key from a policy label.
-    """
-    emitter = _setup_emitter(general_config)
+    """Get a policy public key from a policy label."""
+    emitter = setup_emitter(general_config)
     ALICE = character_options.create_character(emitter, config_file, general_config.json_ipc, load_seednodes=False)
     return ALICE.controller.derive_policy_encrypting_key(label=label)
 
@@ -401,21 +419,19 @@ def derive_policy_pubkey(general_config, label, character_options, config_file):
 @group_general_config
 @group_character_options
 def grant(general_config,
-          # Other (required)
-          bob_encrypting_key, bob_verifying_key, label, value, rate,
+          bob_encrypting_key,
+          bob_verifying_key,
+          label,
+          value,
+          rate,
+          expiration,
+          m, n,
+          character_options,
+          config_file):
+    """Create and enact an access policy for some Bob. """
 
-          # Other
-          expiration, m, n,
-
-          # API Options
-          character_options, config_file
-          ):
-    """
-    Create and enact an access policy for some Bob.
-    """
-    config_options = character_options.config_options
-    emitter = _setup_emitter(general_config)
-
+    # Setup
+    emitter = setup_emitter(general_config)
     ALICE = character_options.create_character(emitter, config_file, general_config.json_ipc)
 
     # Input validation
@@ -451,22 +467,10 @@ def grant(general_config,
 @group_character_options
 @option_config_file
 @group_general_config
-def revoke(general_config,
-
-           # Other (required)
-           bob_verifying_key, label,
-
-           # API Options
-           character_options, config_file
-           ):
-    """
-    Revoke a policy.
-    """
-    emitter = _setup_emitter(general_config)
-
+def revoke(general_config, bob_verifying_key, label, character_options, config_file):
+    """Revoke a policy."""
+    emitter = setup_emitter(general_config)
     ALICE = character_options.create_character(emitter, config_file, general_config.json_ipc)
-
-    # Request
     revoke_request = {'label': label, 'bob_verifying_key': bob_verifying_key}
     return ALICE.controller.revoke(request=revoke_request)
 
@@ -476,31 +480,10 @@ def revoke(general_config,
 @group_character_options
 @option_config_file
 @group_general_config
-def decrypt(general_config,
-
-            # Other (required)
-            label, message_kit,
-
-            # API Options
-            character_options, config_file
-            ):
-    """
-    Decrypt data encrypted under an Alice's policy public key.
-    """
-    emitter = _setup_emitter(general_config)
-
+def decrypt(general_config, label, message_kit, character_options, config_file):
+    """Decrypt data encrypted under an Alice's policy public key."""
+    emitter = setup_emitter(general_config)
     ALICE = character_options.create_character(emitter, config_file, general_config.json_ipc, load_seednodes=False)
-
-    # Request
     request_data = {'label': label, 'message_kit': message_kit}
     response = ALICE.controller.decrypt(request=request_data)
     return response
-
-
-def _setup_emitter(general_config):
-    # Banner
-    emitter = general_config.emitter
-    emitter.clear()
-    emitter.banner(ALICE_BANNER)
-
-    return emitter
